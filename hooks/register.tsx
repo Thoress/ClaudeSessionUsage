@@ -37,6 +37,9 @@ const FILTER = { plugin: 'session-insights', key: 'filter' } as const
 const MEASURE = { plugin: 'session-insights', key: 'measure' } as const
 const POPOVER = { plugin: 'session-insights', key: 'popover' } as const
 const PREVIEW = { plugin: 'session-insights', key: 'preview' } as const
+const VIEW = { plugin: 'session-insights', key: 'view' } as const
+// the tab a preview's full view opens in
+const VIEW_PANE = 'session-insights-view'
 
 const FS_READ_LIMIT = 4 * 1024 * 1024
 
@@ -305,8 +308,12 @@ async function measureShares($: EngineInterface): Promise<void> {
     // the reports may have been replaced meanwhile: add the shares to the newest
     const { value: now } = await $.state.get(CURRENT)
     if (now) await $.state.set(CURRENT, withShares(now, measured))
-    const { value: pane } = await $.state.get(REPORT)
-    if (pane && pane.sessionId === r.sessionId) await $.state.set(REPORT, withShares(pane, measured))
+    const full = reports.get(r.sessionId)
+    if (full) {
+      const { value: ref } = await $.state.get(REPORT)
+      reports.set(r.sessionId, withShares(full, measured))
+      if (ref?.sessionId === r.sessionId) await $.state.set(REPORT, { sessionId: r.sessionId, rev: ++rev })
+    }
     await $.state.set(MEASURE, { state: 'idle' })
   } catch (err) {
     await $.state.set(MEASURE, { state: 'error', error: (err as Error)?.message ?? String(err) })
@@ -314,6 +321,59 @@ async function measureShares($: EngineInterface): Promise<void> {
 }
 
 // ---------- keeping the reports current ----------
+
+// what a pane drawn without its report asks for, once a few seconds at most
+let reanalyzedAt = -Infinity
+function reanalyze($: EngineInterface, sessionId: string) {
+  $.clock.after(0, async () => {
+    const now = await $.clock.now()
+    if (now - reanalyzedAt < 5000) return
+    reanalyzedAt = now
+    await refreshPane($, sessionId)
+  })
+}
+
+// derived values a pane draw would otherwise compute again on every redraw
+// (a tab switch, a filter, a preview): the filtered reports and the charts,
+// keyed by the report's revision, the filter and the width
+const memo = new Map<string, unknown>()
+function memoize<T>(key: string, make: () => T): T {
+  if (memo.has(key)) return memo.get(key) as T
+  if (memo.size > 80) memo.clear()
+  const value = make()
+  memo.set(key, value)
+  return value
+}
+
+// the reports themselves, by session: a state value is copied on every read
+// and a long session's report runs to megabytes, so state holds only which
+// one the pane shows (with a revision that redraws it) and a slim copy for
+// the footer. A hot reload empties this; the pane then analyzes again.
+const reports = new Map<string, UsageReport>()
+let rev = 0
+
+/** The report without its long lists: what the footer and the popover draw from. */
+const slim = (r: UsageReport): UsageReport => ({
+  ...r,
+  series: [],
+  breaks: [],
+  cats: [],
+  modelByCat: [],
+  tools: [],
+  slowest: [],
+  turnRows: [],
+  turnCats: [],
+  toolTurns: [],
+  groups: [],
+  top: [],
+  agents: [],
+})
+
+/** Puts a report on the pane. */
+async function showReport($: EngineInterface, r: UsageReport) {
+  reports.set(r.sessionId, r)
+  await $.state.set(REPORT, { sessionId: r.sessionId, rev: ++rev })
+}
 
 /** Analyzes the running session for the footer, and for the pane when it shows this session. */
 async function refreshCurrent($: EngineInterface): Promise<UsageReport | undefined> {
@@ -324,9 +384,10 @@ async function refreshCurrent($: EngineInterface): Promise<UsageReport | undefin
   // keep the shares of the last measurement until the new one lands
   const { value: before } = await $.state.get(CURRENT)
   const report = before?.live && before.sessionId === sessionId ? withShares(r, before.live.limits) : r
-  await $.state.set(CURRENT, report)
-  const { value: pane } = await $.state.get(REPORT)
-  if (!pane || pane.sessionId === sessionId) await $.state.set(REPORT, report)
+  reports.set(sessionId, report)
+  await $.state.set(CURRENT, slim(report))
+  const { value: ref } = await $.state.get(REPORT)
+  if (!ref || ref.sessionId === sessionId) await showReport($, report)
   // work that outlives this dispatch runs from a timer
   if (report.live && !measuring) {
     $.clock.after(0, () => {
@@ -348,10 +409,10 @@ async function refreshPane($: EngineInterface, sessionId: string): Promise<Usage
     let r: UsageReport | undefined
     if (sessionId === (await $.session.id())) {
       r = await refreshCurrent($)
-      if (r) await $.state.set(REPORT, r)
+      if (r) await showReport($, r)
     } else {
       r = await analyze($, sessionId)
-      await $.state.set(REPORT, r)
+      await showReport($, r)
       await $.state.set(FILTER, NO_FILTER)
       await $.state.set(PREVIEW, null)
     }
@@ -389,7 +450,9 @@ const FILE_CATS = /^(code|doc)_(read|write)$|^(scratch|instructions)$/
 const TURN_CATS = /^(prompt|reply|thinking)$/
 const PREVIEW_CHARS = 60_000
 /** Lines a preview shows at once, until "Show all". */
-const PREVIEW_LINES = 30
+const PREVIEW_LINES = 12
+/** Turns the Overview lists; the Timeline tab lists them all. */
+const OVERVIEW_TURNS = 12
 
 /** The first turn an entry cost anything in. */
 const firstTurn = (g: Group) =>
@@ -522,28 +585,63 @@ async function turnPreview($: EngineInterface, raw: UsageReport, turn: number): 
   let from = row.promptId ? rows.findIndex(r => r.uuid === row.promptId) : -1
   if (from < 0) from = rows.findIndex(r => at(r) >= row.startedAt)
   if (from < 0) return undefined
+  // who speaks heads each stretch: your words quoted under "You", Claude's
+  // text plain under "Claude", its tool calls a list in between
   const parts: string[] = []
+  let speaker: 'you' | 'claude' | undefined
+  let calls: string[] = []
+  const flushCalls = () => {
+    if (calls.length > 0) parts.push(calls.join('\n'))
+    calls = []
+  }
+  const turnTo = (who: 'you' | 'claude') => {
+    flushCalls()
+    if (who !== speaker) parts.push(who === 'you' ? '---\n\n#### You' : '#### Claude')
+    speaker = who
+  }
+  const quote = (s: string) =>
+    s
+      .split('\n')
+      .map(l => `> ${l}`)
+      .join('\n')
   for (const r of rows.slice(from)) {
     if (next && (r.uuid === next.promptId || at(r) >= next.startedAt)) break
     const content = r.message?.content
     if (r.type === 'user' && !r.isMeta && !r.isCompactSummary) {
       const isResult = Array.isArray(content) && content.some((b: any) => b?.type === 'tool_result')
-      const text = isResult ? '' : textOf(content).trim()
-      if (text) parts.push(`**You:** ${text}`)
+      const text = isResult ? '' : textOf(content).replace(/<[^>]+>/g, '').trim()
+      if (text) {
+        turnTo('you')
+        parts.push(quote(text))
+      }
     } else if (r.type === 'assistant') {
       for (const b of Array.isArray(content) ? content : []) {
-        if (b?.type === 'text' && b.text?.trim()) parts.push(b.text.trim())
-        else if (b?.type === 'tool_use') {
+        if (b?.type === 'text' && b.text?.trim()) {
+          turnTo('claude')
+          parts.push(b.text.trim())
+        } else if (b?.type === 'thinking' && b.thinking?.trim()) {
+          turnTo('claude')
+          parts.push(`*Thinking: ${b.thinking.trim().replace(/\s+/g, ' ')}*`)
+        } else if (b?.type === 'tool_use') {
+          if (speaker !== 'claude') turnTo('claude')
           const i = b.input ?? {}
           const what = String(i.description ?? i.file_path ?? i.command ?? i.pattern ?? i.url ?? i.query ?? i.skill ?? '').split('\n')[0]!.slice(0, 100)
-          parts.push(`\`→ ${b.name}${what ? `: ${what}` : ''}\``)
-        } else if (b?.type === 'thinking' && b.thinking?.trim()) parts.push(`*Thinking:* ${b.thinking.trim()}`)
+          calls.push(`- \`${b.name}\`${what ? ` ${what.replace(/[`*_]/g, '')}` : ''}`)
+        }
       }
     }
   }
+  flushCalls()
   if (parts.length === 0) return undefined
-  const { text: source, note } = cutTo(parts.join('\n\n'), PREVIEW_CHARS)
+  const { text: source, note } = cutTo(parts.join('\n\n').replace(/^---\n\n/, ''), PREVIEW_CHARS)
   return { title: `Turn ${turn}: ${row.prompt}`, source, note, isMarkdown: true }
+}
+
+/** Opens a preview whole in a tab of its own, which scrolls. */
+async function openView($: EngineInterface, p: Preview) {
+  await $.state.set(VIEW, p)
+  const name = p.path ? (p.path.split(/[\\/]/).pop() ?? p.title) : p.title
+  await $.ui.open({ id: VIEW_PANE, title: cut(name, 40), columns: 110 })
 }
 
 // the prompts' rows as the chat draws them: their text → the id a scroll takes
@@ -697,8 +795,8 @@ export const register: Register = on => {
     const openDetails = async () => {
       await $.state.set(POPOVER, false)
       await $.ui.open({ id: PANE, title: 'Session usage', columns: 110 })
-      const { value: pane } = await $.state.get(REPORT)
-      if (!pane || pane.sessionId !== r.sessionId) await refreshPane($, r.sessionId)
+      const { value: ref } = await $.state.get(REPORT)
+      if (!ref || ref.sessionId !== r.sessionId || !reports.has(r.sessionId)) await refreshPane($, r.sessionId)
     }
     // the band is the app's, as wide as the prompt; the card sits in its middle
     return (
@@ -715,8 +813,37 @@ export const register: Register = on => {
     )
   })
 
+  // the full view of a preview: a pane of its own, which the surface scrolls
+  on('ui.render', { component: 'Pane', requestId: VIEW_PANE }, async ($, e) => {
+    const { value: view = null } = await $.state.get(VIEW)
+    const { Box, Text, Code, Markdown } = $.ui.resolve(e)
+    if (!view) {
+      return (
+        <Box flexDirection="column">
+          <Text dimColor>Click an entry in Session usage to see it here.</Text>
+        </Box>
+      )
+    }
+    return (
+      <Box flexDirection="column">
+        <Text bold>{view.title}</Text>
+        {view.note ? <Text dimColor>{view.note}</Text> : null}
+        <Box marginTop={1}>
+          {view.isMarkdown ? (
+            <Markdown text={view.source} />
+          ) : (
+            <Code source={view.source} language={view.language} path={view.path} startLine={view.path ? 1 : undefined} />
+          )}
+        </Box>
+      </Box>
+    )
+  })
+
   on('ui.render', { component: 'Pane', requestId: PANE }, async ($, e) => {
-    const { value: raw = null } = await $.state.get(REPORT)
+    const { value: ref = null } = await $.state.get(REPORT)
+    const raw = ref ? (reports.get(ref.sessionId) ?? null) : null
+    // the module was reloaded since: its reports are gone, analyze again
+    if (ref && !raw) reanalyze($, ref.sessionId)
     const { value: stored = 'overview' } = await $.state.get(TAB)
     const { value: note = '' } = await $.state.get(STATUS)
     const { value: filter = NO_FILTER } = await $.state.get(FILTER)
@@ -736,7 +863,9 @@ export const register: Register = on => {
     }
 
     const v = viewOf(filter)
-    const r = applyFilter(raw, filter)
+    // everything derived from the report is computed once per revision, filter and width
+    const base = `${raw.sessionId}|${ref?.rev ?? 0}|${filter.turns.join(',')}/${filter.cats.join(',')}|${cols}`
+    const r = memoize(`${base}|r`, () => applyFilter(raw, filter))
     const tabs = TABS.filter(([id]) => id !== 'agents' || raw.agents.length > 0)
     const wanted = OLD_TABS[stored] ?? stored
     const current = tabs.some(([id]) => id === wanted) ? wanted : 'overview'
@@ -793,9 +922,11 @@ export const register: Register = on => {
       setChartWidth(cols * PX_PER_COLUMN - 24)
       // an interactive Svg is drawn in a frame of its own, which does not take
       // the markup's size by itself: it is given the size the markup declares
-      const chart = (source: string, alt: string) => {
-        const fitted = fits(source)
-        const { width, height } = svgSize(fitted)
+      const chart = (name: string, make: () => string, alt: string) => {
+        const { fitted, width, height } = memoize(`${base}|chart|${name}`, () => {
+          const fitted = fits(make())
+          return { fitted, ...svgSize(fitted) }
+        })
         return (
           <Box marginTop={2}>
             <Svg source={fitted} alt={alt} width={width} height={height} isInteractive />
@@ -868,8 +999,8 @@ export const register: Register = on => {
 
       // the rows to pick from stay whole: kinds of content under the picked
       // turns, turns under the picked kinds; the picked ones are highlighted
-      const byCats = applyFilter(raw, { turns: filter.turns, cats: [] })
-      const byTurns = applyFilter(raw, { turns: [], cats: filter.cats })
+      const byCats = memoize(`${base}|byCats`, () => applyFilter(raw, { turns: filter.turns, cats: [] }))
+      const byTurns = memoize(`${base}|byTurns`, () => applyFilter(raw, { turns: [], cats: filter.cats }))
       const totalCost = byCats.cost.total
       const contentRows = (limit: number): Row[] =>
         [...byCats.cats]
@@ -930,6 +1061,13 @@ export const register: Register = on => {
           onPress: lead === 'none' ? undefined : () => void goTo(g),
         }
       }
+      // the `n` rows that cost the most, kept in their order
+      const costliest = (list: Row[], n: number) => {
+        if (list.length <= n) return list
+        const total = (x: Row) => x.segs.reduce((s, sg) => s + sg.v, 0)
+        const keep = new Set([...list].sort((a, b) => total(b) - total(a)).slice(0, n))
+        return list.filter(x => keep.has(x) || x.isSelected)
+      }
       const turnTimeRows = (): Row[] =>
         raw.turnRows.map(t => {
           const isSelected = v.turns.has(t.turn)
@@ -967,9 +1105,9 @@ export const register: Register = on => {
           heading('Cost per turn', TURN_INFO + ' Click a turn to filter everything to it.'),
           legend(costLegend),
           rows(turnRows()),
-          chart(contextChart(r, v.isContent), 'Context sent per request'),
-          chart(costChart(r, v.isContent), 'Cost per request'),
-          chart(cumulativeChart(r), 'Running total of the cost'),
+          chart('context', () => contextChart(r, v.isContent), 'Context sent per request'),
+          chart('cost', () => costChart(r, v.isContent), 'Cost per request'),
+          chart('cumulative', () => cumulativeChart(r), 'Running total of the cost'),
         ]
       } else if (current === 'content') {
         const picked = [...v.cats]
@@ -998,7 +1136,7 @@ export const register: Register = on => {
         ]
       } else if (current === 'time') {
         body = [
-          chart(timeChart(r), 'Active time by activity'),
+          chart('time', () => timeChart(r), 'Active time by activity'),
           heading('Time per turn', 'How long Claude worked on each prompt, from the prompt to its last action. Click a turn to filter everything to it.'),
           legend([
             ['read', 'Claude'],
@@ -1007,7 +1145,7 @@ export const register: Register = on => {
             ['other', 'Other'],
           ]),
           rows(turnTimeRows()),
-          chart(toolsTable(r), 'Tools: calls, total and average time, result tokens'),
+          chart('tools', () => toolsTable(r), 'Tools: calls, total and average time, result tokens'),
           heading('Slowest single calls', 'From the call to its result; a call that waited for your approval includes that wait. Click one to see the call and what came back.'),
           rows(
             r.slowest.slice(0, 15).map((s, k) => {
@@ -1039,11 +1177,11 @@ export const register: Register = on => {
           rows(topGroups(raw, v).map(g => entryRow(g, 'top', true))),
         ]
       } else if (current === 'agents') {
-        body = [chart(agentsTable(r), 'Subagents: requests, tokens, time and cost')]
+        body = [chart('agents', () => agentsTable(r), 'Subagents: requests, tokens, time and cost')]
       } else {
         const allCats = byCats.cats.filter(c => c.inputCost + c.outputCost > 0.0005).length
         body = [
-          chart(overviewTop(r, { isContent: v.isContent, measure }), `${money(r.cost.total)} at API prices, ${money(r.cost.noCache)} without caching`),
+          chart(`top|${JSON.stringify(measure ?? null)}`, () => overviewTop(r, { isContent: v.isContent, measure }), `${money(r.cost.total)} at API prices, ${money(r.cost.noCache)} without caching`),
           heading('Where the money went', CONTENT_INFO),
           legend([
             ['read', 'Sent as context (input)'],
@@ -1051,10 +1189,14 @@ export const register: Register = on => {
           ]),
           rows(contentRows(5)),
           ...(allCats > 5 ? [<Text dimColor>{`Top 5 of ${allCats} · all on the By content tab`}</Text>] : []),
-          chart(timeChart(r, 5, 'Where the time went', 'all on the Time tab'), 'The five activities that took the most time'),
+          chart('time5', () => timeChart(r, 5, 'Where the time went', 'all on the Time tab'), 'The five activities that took the most time'),
           heading('Cost per turn', TURN_INFO + ' Click a turn to filter everything to it.'),
           legend(costLegend),
-          rows(turnRows()),
+          // a long session has hundreds of turns: the costliest here, in order, all on the Timeline tab
+          rows(costliest(turnRows(), OVERVIEW_TURNS)),
+          ...(raw.turnRows.length > OVERVIEW_TURNS
+            ? [<Text dimColor>{`The ${OVERVIEW_TURNS} costliest of ${raw.turnRows.length} turns · all on the Timeline tab`}</Text>]
+            : []),
         ]
       }
 
@@ -1141,18 +1283,11 @@ export const register: Register = on => {
 
       // what a details entry's click put on show: the file, script, output or skill itself
       const { Code, Markdown } = els
-      // a long preview shows a window of its lines, stepped with ▲ ▼, so the
-      // pane keeps its length (a Box clips but does not scroll); "Show all" lifts it
+      // the first lines inline; the whole of it in a tab of its own, which scrolls
+      // (a Box in a pane clips but does not scroll)
       const lines = preview ? preview.source.split('\n') : []
-      const isWindowed = preview !== null && !preview.isExpanded && lines.length > PREVIEW_LINES
-      const first = isWindowed ? Math.min(Math.max(0, preview.offset ?? 0), lines.length - PREVIEW_LINES) : 0
-      const shownSource = isWindowed ? lines.slice(first, first + PREVIEW_LINES).join('\n') : (preview?.source ?? '')
-      const movePreview = async (change: (p: Preview) => Partial<Preview>) => {
-        const { value: now } = await $.state.get(PREVIEW)
-        if (now) await $.state.set(PREVIEW, { ...now, ...change(now) })
-      }
-      const step = (by: number) => () =>
-        void movePreview(p => ({ offset: Math.min(Math.max(0, (p.offset ?? 0) + by), Math.max(0, lines.length - PREVIEW_LINES)) }))
+      const head = lines.slice(0, PREVIEW_LINES).join('\n')
+      const rest = Math.max(0, lines.length - PREVIEW_LINES)
       const shown = preview ? (
         <Box flexDirection="column" marginTop={2} borderStyle="round" borderDimColor paddingX={1}>
           <Box flexDirection="row" justifyContent="space-between" alignItems="center" gap={1}>
@@ -1164,25 +1299,15 @@ export const register: Register = on => {
           {preview.note ? <Text dimColor>{preview.note}</Text> : null}
           <Box marginTop={1}>
             {preview.isMarkdown ? (
-              <Markdown text={shownSource} />
+              <Markdown text={head} />
             ) : (
-              <Code source={shownSource} language={preview.language} path={preview.path} startLine={first + 1} />
+              <Code source={head} language={preview.language} path={preview.path} startLine={preview.path ? 1 : undefined} />
             )}
           </Box>
-          {lines.length > PREVIEW_LINES ? (
-            <Box flexDirection="row" alignItems="center" gap={1} marginTop={1}>
-              {isWindowed ? (
-                <>
-                  <Button key="preview-up" label="▲" dimColor onPress={step(-PREVIEW_LINES)} />
-                  <Button key="preview-down" label="▼" dimColor onPress={step(PREVIEW_LINES)} />
-                  <Text dimColor>{`lines ${first + 1}–${Math.min(lines.length, first + PREVIEW_LINES)} of ${lines.length}`}</Text>
-                  <Button key="preview-all" label="Show all" dimColor onPress={() => void movePreview(() => ({ isExpanded: true }))} />
-                </>
-              ) : (
-                <Button key="preview-less" label="Show less" dimColor onPress={() => void movePreview(() => ({ isExpanded: false }))} />
-              )}
-            </Box>
-          ) : null}
+          <Box flexDirection="row" alignItems="center" gap={1} marginTop={1}>
+            <Button key="preview-open" label="Open full view ↗" onPress={() => void openView($, preview)} />
+            {rest > 0 ? <Text dimColor>{`${rest} more line${rest === 1 ? '' : 's'}`}</Text> : null}
+          </Box>
         </Box>
       ) : null
 

@@ -221,11 +221,15 @@ export type Preview = {
   isMarkdown?: boolean
   /** A dim line under the title: a command's description, a cut. */
   note?: string
-  /** The first line shown, 0-based, while the preview shows a window of its lines. */
-  offset?: number
-  /** All lines shown at once, not a window. */
-  isExpanded?: boolean
 }
+
+/**
+ * Which session's report the pane shows. The report itself stays in the
+ * module's memory: a state value is copied on every read, and a long
+ * session's report runs to megabytes; `rev` changes with every new report,
+ * which is what redraws the pane.
+ */
+export type ReportRef = { sessionId: string; rev: number }
 
 /** The background measurement of the limits' shares. */
 export type Measure = { state: 'idle' | 'measuring' | 'error'; files?: number; error?: string }
@@ -233,8 +237,8 @@ export type Measure = { state: 'idle' | 'measuring' | 'error'; files?: number; e
 declare module 'claude-code' {
   interface PluginState {
     'session-insights': {
-      report: UsageReport | null
-      /** The running session's own report, for the footer, whatever the pane shows. */
+      report: ReportRef | null
+      /** The running session's own report for the footer and popover, its long lists left out. */
       current: UsageReport | null
       tab: string
       status: string
@@ -244,6 +248,8 @@ declare module 'claude-code' {
       popover: boolean
       /** What a details entry's click put on show in the pane. */
       preview: Preview | null
+      /** What the full-view tab shows. */
+      view: Preview | null
     }
   }
 }
