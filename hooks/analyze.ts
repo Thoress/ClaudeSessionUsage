@@ -55,6 +55,7 @@ export const CATS: Record<string, { label: string; color: string }> = {
   web: { label: 'Web pages, search & browser', color: '#d4b13a' },
   agents: { label: 'Subagent prompts & results', color: '#cf5a7a' },
   mcp: { label: 'Other MCP tools', color: '#8a9a3a' },
+  scratch: { label: 'Scratchpad & temp files', color: '#8a7fb0' },
   other_tools: { label: 'Other tools', color: '#9a8a6a' },
   other: { label: 'Unattributed', color: '#5a5a5a' },
 }
@@ -148,6 +149,19 @@ function skillName(text: string): string {
 
 const isCodePath =(p: unknown) => CODE_EXT.test(String(p ?? ''))
 
+/** CLAUDE.md files anywhere, and the auto-memory under ~/.claude. */
+const isMemoryPath = (p: unknown) => {
+  const s = String(p ?? '')
+  return /(^|[\\/])CLAUDE(\.local)?\.md$/i.test(s) || /[\\/]\.claude[\\/](projects[\\/][^\\/]+[\\/])?memory[\\/]/i.test(s)
+}
+
+/** Claude's own working files: the session scratchpad and its temp folder. */
+const isScratchPath = (p: unknown) => /[\\/](Temp|tmp)[\\/]claude[\\/]|[\\/]scratchpad([\\/]|$)/i.test(String(p ?? ''))
+
+/** The kind a file read or written counts under. */
+const fileCat = (p: unknown, isWrite: boolean) =>
+  isMemoryPath(p) ? 'instructions' : isScratchPath(p) ? 'scratch' : isCodePath(p) ? (isWrite ? 'code_write' : 'code_read') : isWrite ? 'doc_write' : 'doc_read'
+
 const isWeb = (name: string) =>
   name === 'WebFetch' ||
   name === 'WebSearch' ||
@@ -198,12 +212,12 @@ function classifyTool(name: string, input: Row): Omit<ToolInfo, 'startedAt'> {
   }
   if (name === 'Read' || name === 'NotebookRead') {
     const p = i.file_path ?? i.notebook_path
-    const cat = isCodePath(p) ? 'code_read' : 'doc_read'
+    const cat = fileCat(p, false)
     return { name, inCat: cat, outCat: cat, label: `Read ${baseName(p)}`, bucket: 't_files', path: str(p) }
   }
   if (name === 'Write' || name === 'Edit' || name === 'MultiEdit' || name === 'NotebookEdit') {
     const p = i.file_path ?? i.notebook_path
-    const cat = isCodePath(p) ? 'code_write' : 'doc_write'
+    const cat = fileCat(p, true)
     return { name, inCat: cat, outCat: cat, label: `${name} ${baseName(p)}`, bucket: 't_files', path: str(p) }
   }
   if (name === 'Grep' || name === 'Glob' || name === 'LS') {
@@ -665,9 +679,19 @@ export function analyzeChain(rows: Row[], turnOf?: (at: number) => number): Chai
     }
 
     if (type === 'attachment') {
-      const kind = String(r.attachment?.type ?? '')
+      const a = r.attachment ?? {}
+      const kind = String(a.type ?? '')
       const w = renderedWeight(r)
-      if (w > 0) pending.push(newItem(attachmentCat(kind), w, `Reminder: ${kind}`))
+      const cat = attachmentCat(kind)
+      const files: { path?: unknown; content?: unknown }[] =
+        cat !== 'instructions' ? [] : Array.isArray(a.files) ? a.files : typeof a.path === 'string' ? [{ path: a.path, content: a.content }] : []
+      const sizes = files.map(f => Math.max(1, textLen(f.content)))
+      const all = sizes.reduce((x, y) => x + y, 0)
+      if (w > 0 && files.length > 0) {
+        files.forEach((f, k) =>
+          pending.push(newItem('instructions', (w * sizes[k]!) / all, `Instructions: ${baseName(f.path)}`, undefined, { path: str(f.path), messageId: rowId(r.uuid) })),
+        )
+      } else if (w > 0) pending.push(newItem(cat, w, `Reminder: ${kind}`, undefined, { messageId: rowId(r.uuid) }))
       touch(at)
       if (Number.isFinite(at)) lastInputAt = at
       continue
@@ -735,7 +759,7 @@ export function analyzeChain(rows: Row[], turnOf?: (at: number) => number): Chai
             row.ms += ms
             res.tools.set(info.name, row)
             const tn = turnNow(info.startedAt)
-            res.slow.push({ label: info.label, ms, bucket, turn: tn })
+            res.slow.push({ label: info.label, ms, bucket, turn: tn, toolUseId: info.ref.toolUseId })
             const key = `${tn}|${info.name}`
             const tt = res.toolTurns.get(key) ?? { turn: tn, tool: info.name, calls: 0, ms: 0, resultTokens: 0 }
             tt.calls++
@@ -1034,7 +1058,8 @@ function groupLabel(it: Item): string {
   const l = it.label.replace(/ → result$/, '')
   if (it.cat === 'skills') return l.replace(/^Skill:? /, '')
   if (/^(code|doc)_(read|write)$/.test(it.cat)) return l.replace(/^(Read|Write|Edit|MultiEdit|NotebookEdit|NotebookRead) /, '')
-  if (it.cat === 'reminders' || it.cat === 'tooling' || it.cat === 'instructions') return l.replace(/^(Reminder|Meta): /, '')
+  if (it.cat === 'reminders' || it.cat === 'tooling' || it.cat === 'instructions') return l.replace(/^(Reminder|Meta|Instructions): /, '').replace(/^(Read|Write|Edit|MultiEdit) /, '')
+  if (it.cat === 'scratch') return l.replace(/^(Read|Write|Edit|MultiEdit|NotebookEdit|NotebookRead) /, '')
   if (it.cat === 'prompt') return l.replace(/^Prompt: /, '')
   if (it.cat === 'reply') return `Replies in turn ${it.turnAdded ?? 0}`
   return l

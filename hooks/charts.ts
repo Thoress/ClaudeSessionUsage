@@ -96,6 +96,27 @@ type Tip = { title: string; lines?: TipLine[]; text?: string }
 /** Where a card would go; kept so callers read the same. */
 type Anchor = { x: number; top: number; bottom: number; place: 'side' | 'row' }
 
+/** `as of 12m ago` for a limit read earlier by another session; undefined for this session's own reading. */
+export const readAgo = (l: LimitWindow, now: number) =>
+  l.readAt === undefined ? undefined : `as of ${dur(Math.max(60_000, now - l.readAt)).replace(/ 00[ms]$/, '')} ago`
+
+/**
+ * About how wide `s` draws in px at `size`, semibold system-ui: a width per
+ * character class, close enough to set an icon after a title.
+ */
+function textWidth(s: string, size: number): number {
+  let em = 0
+  for (const ch of s) {
+    if (/[ilj.,:;'|!]/.test(ch)) em += 0.26
+    else if (/[ frt()\-/]/.test(ch)) em += 0.36
+    else if (/[mwMW]/.test(ch)) em += 0.86
+    else if (/[A-Z]/.test(ch)) em += 0.64
+    else if (/[0-9]/.test(ch)) em += 0.56
+    else em += 0.54
+  }
+  return em * size
+}
+
 const tipText = (t: Tip) =>
   [t.title, t.text, ...(t.lines ?? []).map(l => (l.value ? `${l.label}: ${l.value}` : l.label))].filter(Boolean).join('\n')
 
@@ -103,7 +124,8 @@ const tipText = (t: Tip) =>
 const infoMark = (x: number, y: number, info: string) =>
   `<g class="icon"><title>${esc(info)}</title><rect x="${n1(x)}" y="${n1(y)}" width="18" height="18" fill="transparent"/>` +
   `<circle cx="${n1(x + 9)}" cy="${n1(y + 9)}" r="7" class="ic" stroke-width="1.4"/>` +
-  `<text x="${n1(x + 9)}" y="${n1(y + 13)}" text-anchor="middle" font-size="11" font-weight="700" class="ict">i</text></g>`
+  // the size as a style: a chart's stylesheet sizes every text, and beats an attribute
+  `<text x="${n1(x + 9)}" y="${n1(y + 13)}" text-anchor="middle" style="font-size:11px;font-weight:700" class="ict">i</text></g>`
 
 class Canvas {
   private parts: string[] = []
@@ -124,8 +146,8 @@ class Canvas {
   /** A chart title, with the (i) icon after it whose tooltip holds `info`. */
   title(s: string, info?: string, y = 18) {
     this.add(text(0, y, s, 't f16 b'))
-    // the title's width, estimated: about 0.56em a character at 16px, semibold
-    if (info) this.add(infoMark(s.length * 8.9 + 8, y - 14, `${s}\n\n${info}`))
+    // after the title's estimated width, the gap a native heading leaves before its (i)
+    if (info) this.add(infoMark(textWidth(s, 16) + 7, y - 14, `${s}\n\n${info}`))
   }
 
   /** A dim line under the chart. */
@@ -195,16 +217,22 @@ export function overviewTop(r: UsageReport, opts: { isContent?: boolean; measure
       return {
         label,
         value: '–',
-        sub: 'subscription only',
-        tip: { title: `Your ${name} usage limit`, text: 'The API reports rate-limit usage only on a subscription, and only to the running session; there is no reading here.' },
+        sub: live ? 'shows after the next reply' : 'running session only',
+        tip: {
+          title: `Your ${name} usage limit`,
+          text: live
+            ? 'The API reports the limits with each reply, on a subscription. No session has had a reply in this window yet; the figure shows after the next one.'
+            : 'The limits are known only to a running session; this report is about an earlier one.',
+        },
       }
     }
     const hasShare = l.session !== undefined
     const mine = Math.min(l.session ?? 0, l.percentUsed)
+    const asOf = readAgo(l, r.generatedAt)
     return {
       label: `${label}: this session`,
       value: hasShare ? `${mine < 10 ? mine.toFixed(1) : Math.round(mine)}%` : '…',
-      sub: hasShare ? `${Math.round(l.percentUsed)}% used in all · ${resets(l.resetsAt)}` : `${Math.round(l.percentUsed)}% used in all · ${pending}`,
+      sub: asOf ? `${Math.round(l.percentUsed)}% in all · ${asOf}` : `${Math.round(l.percentUsed)}% used in all · ${hasShare ? resets(l.resetsAt) : pending}`,
       bar: { used: l.percentUsed, mine: hasShare ? mine : undefined },
       tip: {
         title: `Your ${name} usage limit`,
@@ -780,15 +808,17 @@ export function miniBar(segs: { v: number; cls: string }[], max: number, width: 
   const h = 22
   const barH = 14
   const y = (h - barH) / 2
-  let x = 0
+  // room on both sides for the selection's outline, which stands 3px off the bar
+  const pad = 4
+  let x = pad
   let body = ''
   const last = segs.map(sg => sg.v > 0).lastIndexOf(true)
   segs.forEach((sg, i) => {
-    const w = max > 0 ? (sg.v / max) * (width - 4) : 0
+    const w = max > 0 ? (sg.v / max) * (width - 2 * pad) : 0
     body += rect(x, y, Math.max(0, w - (i < last && w > 3 ? 2 : 0)), barH, sg.cls, i === last ? 'right' : 'none')
     x += w
   })
-  if (opts.isSelected) body += `<rect x="0.75" y="${y - 2.25}" width="${n1(Math.max(4, x) + 1.5)}" height="${barH + 4.5}" rx="5" class="sel" stroke-width="1.5"/>`
+  if (opts.isSelected) body += `<rect x="0.75" y="${y - 3}" width="${n1(Math.max(pad + 4, x) + 2.5)}" height="${barH + 6}" rx="5" class="sel" stroke-width="1.5"/>`
   return small(width, h, body, title, opts.isDimmed ? 0.35 : 1)
 }
 
@@ -874,7 +904,7 @@ export function summaryCard(r: UsageReport, measure?: Measure, width = 380): str
   const limitRow = (name: string, l?: LimitWindow) => {
     if (!l) return
     const share = l.session === undefined ? '…' : `≈ ${l.session < 10 ? l.session.toFixed(1) : Math.round(l.session)}%`
-    const detail = l.session === undefined ? `${pending} · ` : `${resets(l.resetsAt)} · `
+    const detail = `${readAgo(l, r.generatedAt) ?? (l.session === undefined ? pending : resets(l.resetsAt))} · `
     body += row(
       y,
       30,

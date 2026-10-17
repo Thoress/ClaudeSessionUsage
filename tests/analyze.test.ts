@@ -195,6 +195,8 @@ describe('cost', () => {
     const b = miniBar([{ v: 2, cls: 'read' }, { v: 1, cls: 'out' }], 3, 200, 'Code written: $2', { isSelected: true })
     expect(b.includes('<title>Code written: $2</title>')).toBe(true)
     expect(b.includes('class="sel"')).toBe(true)
+    // the outline stands off the bar on the left too: the bar starts inset
+    expect(/<rect x="4"/.test(b) || /<path d="M4,/.test(b)).toBe(true)
     expect(miniBar([{ v: 1, cls: 'read' }], 3, 200, 'x', { isDimmed: true }).includes('opacity="0.35"')).toBe(true)
     expect(ring(25, 'a\nb').includes('<title>a\nb</title>')).toBe(true)
     expect(infoIcon('why').includes('<title>why</title>')).toBe(true)
@@ -240,8 +242,12 @@ describe('cost', () => {
     // before the shares are measured
     const pending = { ...live, live: { ...live.live, limits: [{ kind: 'five_hour', percentUsed: 38 }] } }
     expect(overviewTop(pending).includes('measuring…')).toBe(true)
-    // without a live session the limits say why they are empty
-    expect(overviewTop(r).includes('subscription only')).toBe(true)
+    // without a live session the limits say why they are empty; a live one with no reading yet says when it comes
+    expect(overviewTop(r).includes('running session only')).toBe(true)
+    expect(overviewTop({ ...r, live: { contextWindow: 1_000_000, limits: [] } }).includes('shows after the next reply')).toBe(true)
+    // a reading another session took says how old it is
+    const borrowed = { ...live, live: { ...live.live, limits: live.live.limits.map(l => ({ ...l, readAt: r.generatedAt - 12 * 60_000 })) } }
+    expect(overviewTop(borrowed).includes('as of 12m ago')).toBe(true)
   })
 })
 
@@ -321,6 +327,39 @@ describe('filter', () => {
     expect(code[0]!.cost > 0).toBe(true)
     // within a turn that did not touch it, nothing
     expect(detailsOf(r, 'code_write', viewOf({ turns: [2], cats: [] })).every(g => g.cost < 0.01)).toBe(true)
+  })
+
+  test('memory and CLAUDE.md count as instructions, the scratchpad as scratch, each file its own entry', () => {
+    const rows = [
+      { type: 'user', uuid: 'p0', timestamp: at(0), message: { role: 'user', content: 'go' } },
+      {
+        type: 'attachment',
+        uuid: 'i0',
+        timestamp: at(0.1),
+        attachment: { type: 'instructions', files: [{ path: 'C:/Users/x/.claude/CLAUDE.md', content: 'a'.repeat(3000) }, { path: 'C:/Users/x/.claude/projects/P/memory/MEMORY.md', content: 'b'.repeat(1000) }] },
+        rendered: [{ content: 'x'.repeat(4000) }],
+      },
+      { type: 'assistant', uuid: 'a1', timestamp: at(1), message: { id: 'a1', usage: usage(0, 9000, 40, 0), content: [
+        { type: 'tool_use', id: 'r1', name: 'Read', input: { file_path: 'C:/Users/x/.claude/projects/P/memory/notes.md' } },
+        { type: 'tool_use', id: 'r2', name: 'Write', input: { file_path: 'C:/Users/x/AppData/Local/Temp/claude/P/abc/scratchpad/t.py', content: 'print(1)\n'.repeat(50) } },
+      ] } },
+      { type: 'user', uuid: 'a2', timestamp: at(2), message: { role: 'user', content: [
+        { type: 'tool_result', tool_use_id: 'r1', content: 'n '.repeat(500) },
+        { type: 'tool_result', tool_use_id: 'r2', content: 'ok' },
+      ] } },
+      { type: 'assistant', uuid: 'a3', timestamp: at(3), message: { id: 'a3', usage: usage(9000, 800, 10, 0), content: [{ type: 'text', text: 'ok' }] } },
+    ]
+    const m = buildReport('m', 'm.jsonl', rows, [], T0 + 10_000)
+    const of = (cat: string) => m.groups.filter(g => g.cat === cat)
+    expect(of('instructions').map(g => g.label).sort()).toEqual(['.claude/CLAUDE.md', 'memory/MEMORY.md', 'memory/notes.md'])
+    expect(of('instructions').find(g => g.label === '.claude/CLAUDE.md')?.ref?.path).toBe('C:/Users/x/.claude/CLAUDE.md')
+    // CLAUDE.md is three times the size of MEMORY.md, so three times its share of the attachment
+    const cost = (label: string) => of('instructions').find(g => g.label === label)!.tokens
+    expect(Math.round(cost('.claude/CLAUDE.md') / cost('memory/MEMORY.md'))).toBe(3)
+    expect(of('scratch').map(g => g.label)).toEqual(['scratchpad/t.py'])
+    expect(of('doc_read').length + of('code_write').length).toBe(0)
+    // the slowest calls keep the call's id
+    expect(m.slowest.every(s => typeof s.toolUseId === 'string')).toBe(true)
   })
 
   test('each entry knows where it leads: its file, page or row', () => {

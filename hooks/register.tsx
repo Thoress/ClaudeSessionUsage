@@ -10,19 +10,17 @@ import {
   cumulativeChart,
   fits,
   infoIcon,
-  itemChart,
   legendStrip,
   miniBar,
   overviewTop,
   setChartWidth,
-  slowChart,
   summaryCard,
   svgSize,
   timeChart,
   toolsTable,
   turnCosts,
 } from './charts'
-import { NO_FILTER, applyFilter, detailsOf, viewOf } from './filter'
+import { NO_FILTER, applyFilter, detailsOf, topGroups, viewOf } from './filter'
 import { bar, cachingStory, cut, dur, mdAgentTable, mdCostTable, money, pct, tok, toMarkdown } from './format'
 import { type CachedFile, type CostPoint, WINDOW_MS, pack, requestCosts, scanLine, unpack, windowShare } from './limits'
 
@@ -247,14 +245,31 @@ const windowStart = (l: LimitWindow) => {
   return span !== undefined && Number.isFinite(end) ? end - span : NaN
 }
 
+// the newest reading of the limits, by any session: they are the account's,
+// and the API reports them only with a reply, so a session resumed or just
+// started has none until its next one
+const LIMITS_KEY = 'last-limits'
+type StoredLimits = { at: number; limits: LimitWindow[] }
+
 /** What only the running session knows: the context fill and the rate limits, as the API reports them. */
 async function liveUsage($: EngineInterface): Promise<LiveUsage> {
   const usage = await $.session.usage()
+  const now = await $.clock.now()
+  let limits: LimitWindow[] = usage.rateLimits.map(l => ({ kind: l.kind, percentUsed: l.percentUsed, resetsAt: l.resetsAt }))
+  if (limits.length > 0) {
+    await $.store.set(LIMITS_KEY, { at: now, limits } satisfies StoredLimits).catch(() => undefined)
+  } else {
+    const stored = (await $.store.get(LIMITS_KEY).catch(() => undefined)) as StoredLimits | undefined
+    // a reading whose window has reset since says nothing any more
+    limits = (stored?.limits ?? [])
+      .filter(l => !l.resetsAt || Date.parse(l.resetsAt) > now)
+      .map(l => ({ ...l, readAt: stored!.at }))
+  }
   return {
     contextTokens: usage.context.tokens,
     contextWindow: usage.context.window,
     contextPercent: usage.context.percent,
-    limits: usage.rateLimits.map(l => ({ kind: l.kind, percentUsed: l.percentUsed, resetsAt: l.resetsAt })),
+    limits,
   }
 }
 
@@ -369,10 +384,12 @@ async function closePopover($: EngineInterface) {
 
 /// ---------- leading from a details entry to what it was ----------
 
-const FILE_CATS = /^(code|doc)_(read|write)$/
-/** Kinds whose entry is best seen whole: a command, its output, a skill, a tool's call and result. */
-const SHOW_CATS = /^(cmd|script|termout|search|skills|mcp|other_tools|agents|web|compaction)$/
+const FILE_CATS = /^(code|doc)_(read|write)$|^(scratch|instructions)$/
+/** Kinds best seen as their turn: what was said, done and answered around them. */
+const TURN_CATS = /^(prompt|reply|thinking)$/
 const PREVIEW_CHARS = 60_000
+/** Lines a preview shows at once, until "Show all". */
+const PREVIEW_LINES = 30
 
 /** The first turn an entry cost anything in. */
 const firstTurn = (g: Group) =>
@@ -381,23 +398,23 @@ const firstTurn = (g: Group) =>
     .map(([t]) => Number(t))
     .sort((a, b) => a - b)[0]
 
-type Lead = 'file' | 'page' | 'show' | 'jump' | 'none'
+type Lead = 'file' | 'page' | 'show' | 'turn' | 'none'
 
-/** Where a click on the entry leads; `isLive` when the pane shows the running session. */
-function leadOf(g: Group, isLive: boolean): Lead {
+/** Where a click on the entry leads. */
+function leadOf(g: Group): Lead {
   if (g.ref?.path && FILE_CATS.test(g.cat)) return 'file'
   if (g.ref?.url) return 'page'
-  if (SHOW_CATS.test(g.cat) && (g.ref?.toolUseId || g.ref?.messageId)) return 'show'
-  if (isLive && firstTurn(g) !== undefined) return 'jump'
-  return g.ref?.messageId ? 'show' : 'none'
+  if (TURN_CATS.test(g.cat) && firstTurn(g) !== undefined) return 'turn'
+  if (g.ref?.toolUseId || g.ref?.messageId) return 'show'
+  return firstTurn(g) === undefined ? 'none' : 'turn'
 }
 
 const leadHint = (lead: Lead, g: Group) =>
   ({
     file: 'Click to show the file',
     page: 'Click to open the page in your browser',
-    show: 'Click to show it here',
-    jump: `Click to jump to turn ${firstTurn(g)} in the chat`,
+    show: 'Click to show it',
+    turn: `Click to show turn ${firstTurn(g)}`,
     none: '',
   })[lead]
 
@@ -456,10 +473,10 @@ async function contentPreview($: EngineInterface, raw: UsageReport, g: Group): P
   const rows = parseJsonl(await readText($, raw.file))
   const title = g.label
   const { messageId, toolUseId } = g.ref ?? {}
-  // a skill or a message: its text as the model read it
+  // a skill, a message or an injected reminder: its text as the model read it
   if (messageId && (!toolUseId || g.cat === 'skills')) {
     const row = rows.find(r => r.uuid === messageId)
-    const text = textOf(row?.message?.content)
+    const text = textOf(row?.message?.content) || textOf(Array.isArray(row?.rendered) ? row.rendered.map((x: any) => x?.content ?? x) : row?.rendered)
     if (text) {
       const { text: source, note } = cutTo(text, PREVIEW_CHARS)
       return { title, source, note, isMarkdown: true }
@@ -492,6 +509,41 @@ async function contentPreview($: EngineInterface, raw: UsageReport, g: Group): P
   const call = JSON.stringify(input, null, 2)
   const { text: source, note } = cutTo(`${use.name} ${call}${output ? `\n\n── result ──\n${output}` : ''}`, PREVIEW_CHARS)
   return { title, source, language: 'text', note }
+}
+
+/** One turn as it went: the prompt, Claude's replies, and a line per tool call. */
+async function turnPreview($: EngineInterface, raw: UsageReport, turn: number): Promise<Preview | undefined> {
+  const row = raw.turnRows.find(t => t.turn === turn)
+  if (!row) return undefined
+  const next = raw.turnRows.find(t => t.turn === turn + 1)
+  const rows = parseJsonl(await readText($, raw.file)).filter(r => r.isSidechain !== true)
+  // from the turn's prompt (else its first moment) to the next turn's
+  const at = (r: any) => (typeof r.timestamp === 'string' ? Date.parse(r.timestamp) : NaN)
+  let from = row.promptId ? rows.findIndex(r => r.uuid === row.promptId) : -1
+  if (from < 0) from = rows.findIndex(r => at(r) >= row.startedAt)
+  if (from < 0) return undefined
+  const parts: string[] = []
+  for (const r of rows.slice(from)) {
+    if (next && (r.uuid === next.promptId || at(r) >= next.startedAt)) break
+    const content = r.message?.content
+    if (r.type === 'user' && !r.isMeta && !r.isCompactSummary) {
+      const isResult = Array.isArray(content) && content.some((b: any) => b?.type === 'tool_result')
+      const text = isResult ? '' : textOf(content).trim()
+      if (text) parts.push(`**You:** ${text}`)
+    } else if (r.type === 'assistant') {
+      for (const b of Array.isArray(content) ? content : []) {
+        if (b?.type === 'text' && b.text?.trim()) parts.push(b.text.trim())
+        else if (b?.type === 'tool_use') {
+          const i = b.input ?? {}
+          const what = String(i.description ?? i.file_path ?? i.command ?? i.pattern ?? i.url ?? i.query ?? i.skill ?? '').split('\n')[0]!.slice(0, 100)
+          parts.push(`\`→ ${b.name}${what ? `: ${what}` : ''}\``)
+        } else if (b?.type === 'thinking' && b.thinking?.trim()) parts.push(`*Thinking:* ${b.thinking.trim()}`)
+      }
+    }
+  }
+  if (parts.length === 0) return undefined
+  const { text: source, note } = cutTo(parts.join('\n\n'), PREVIEW_CHARS)
+  return { title: `Turn ${turn}: ${row.prompt}`, source, note, isMarkdown: true }
 }
 
 // the prompts' rows as the chat draws them: their text → the id a scroll takes
@@ -625,7 +677,8 @@ export const register: Register = on => {
     return (
       <Box flexDirection="row" alignItems="center" gap={1}>
         {e.props.modes.length > 0 ? <Text dimColor>{e.props.modes.join(' & ')}</Text> : null}
-        <Button plain key="usage-toggle" label={`${figure}${isOpen ? ' ▴' : ''}`} onPress={() => void $.state.set(POPOVER, !isOpen)} />
+        {/* the footer draws a button's label alone, no chrome: no-break spaces pad it */}
+        <Button plain key="usage-toggle" label={`  ${figure}${isOpen ? ' ▴' : ' ▾'}  `} onPress={() => void $.state.set(POPOVER, !isOpen)} />
       </Box>
     )
   })
@@ -647,13 +700,16 @@ export const register: Register = on => {
       const { value: pane } = await $.state.get(REPORT)
       if (!pane || pane.sessionId !== r.sessionId) await refreshPane($, r.sessionId)
     }
+    // the band is the app's, as wide as the prompt; the card sits in its middle
     return (
-      <Box flexDirection="column" gap={1}>
-        <Svg source={card} alt={summaryText(r)} width={width} height={height} isInteractive />
-        <Box flexDirection="row">
-          <Button key="usage-details" onPress={() => void openDetails()}>
-            Show the full breakdown
-          </Button>
+      <Box flexDirection="column" alignItems="center" width="100%">
+        <Box flexDirection="column" gap={1} width={Math.ceil(width / PX_PER_COLUMN) + 1}>
+          <Svg source={card} alt={summaryText(r)} width={width} height={height} isInteractive />
+          <Box flexDirection="row">
+            <Button key="usage-details" onPress={() => void openDetails()}>
+              Show the full breakdown
+            </Button>
+          </Box>
         </Box>
       </Box>
     )
@@ -703,7 +759,7 @@ export const register: Register = on => {
       void $.ui.scroll({ in: PANE, to: { key: 'preview-close' }, block: 'start' }).catch(() => undefined)
     }
     const goTo = async (g: Group) => {
-      const lead = leadOf(g, isLive)
+      const lead = leadOf(g)
       const turn = firstTurn(g)
       if (lead === 'file' && g.ref?.path) {
         if (await showInFilesPane($, g.ref.path)) return
@@ -715,11 +771,11 @@ export const register: Register = on => {
         return
       }
       if (lead === 'show') return show(await contentPreview($, raw, g).catch(() => undefined), g.label)
-      if (lead === 'jump' && turn !== undefined) {
-        const why = await jumpToTurn($, raw, turn)
-        if (why === undefined) return
-        if (g.ref?.messageId) return show(await contentPreview($, raw, g).catch(() => undefined), g.label)
-        $.ui.toast(`Could not jump to turn ${turn}: ${why}`)
+      if (lead === 'turn' && turn !== undefined) {
+        // the chat is scrolled where the surface lets a plugin (the terminal);
+        // the desktop does not, so the turn is shown here instead
+        if (isLive && (await jumpToTurn($, raw, turn)) === undefined) return
+        return show(await turnPreview($, raw, turn).catch(() => undefined), `turn ${turn}`)
       }
     }
 
@@ -778,7 +834,14 @@ export const register: Register = on => {
               <Box key={`row-${x.key}`} flexDirection="row" alignItems="center">
                 <Box width={labelCols} flexShrink={0}>
                   {x.onPress ? (
-                    <Button plain key={`pick-${x.key}`} label={x.label} onPress={x.onPress}>
+                    <Button
+                      plain
+                      key={`pick-${x.key}`}
+                      label={cut(x.label, labelCols - 2)}
+                      variant={x.isSelected ? 'primary' : undefined}
+                      dimColor={x.isDimmed}
+                      onPress={x.onPress}
+                    >
                       <Text bold={x.isSelected} dimColor={x.isDimmed} wrap="truncate-end">
                         {cut(x.label, labelCols - 2)}
                       </Text>
@@ -847,6 +910,26 @@ export const register: Register = on => {
             onPress: () => onlyTurn(t.turn),
           }
         })
+      // a details entry's row: its cost, and a click that leads to it
+      const entryRow = (g: Group, prefix: string, withKind = false): Row => {
+        const lead = leadOf(g)
+        const where = g.ref?.path ?? g.ref?.url
+        const kind = CATS[g.cat]?.label ?? g.cat
+        return {
+          key: `${prefix}-${g.cat}-${g.label}`,
+          label: lead === 'none' ? g.label : `${g.label} ↗`,
+          segs: [{ v: g.cost, cls: 'read' }],
+          value: `${money(g.cost)}${g.count > 1 ? ` · ${g.count}×` : ''}`,
+          title: [
+            g.label,
+            ...(withKind ? [kind] : []),
+            `${money(g.cost)} · ${tok(g.tokens)} tokens added${g.count > 1 ? ` · ${g.count} pieces` : ''}`,
+            ...(where && where !== g.label ? [where] : []),
+            ...(lead === 'none' ? [] : [leadHint(lead, g)]),
+          ].join('\n'),
+          onPress: lead === 'none' ? undefined : () => void goTo(g),
+        }
+      }
       const turnTimeRows = (): Row[] =>
         raw.turnRows.map(t => {
           const isSelected = v.turns.has(t.turn)
@@ -909,25 +992,7 @@ export const register: Register = on => {
                   heading(`${CATS[cat]?.label ?? cat}: what it was made of`, 'The most expensive entries of this kind, each summed over all its pieces: every read and edit of a file, every call of a command, every load of a skill.'),
                   details.length === 0
                     ? <Text dimColor>Nothing of this kind in the picked turns.</Text>
-                    : rows(
-                        details.map(g => {
-                          const lead = leadOf(g, isLive)
-                          const where = g.ref?.path ?? g.ref?.url
-                          return {
-                            key: `d-${cat}-${g.label}`,
-                            label: lead === 'none' ? g.label : `${g.label} ↗`,
-                            segs: [{ v: g.cost, cls: 'read' }],
-                            value: `${money(g.cost)}${g.count > 1 ? ` · ${g.count}×` : ''}`,
-                            title: [
-                              g.label,
-                              `${money(g.cost)} · ${tok(g.tokens)} tokens added${g.count > 1 ? ` · ${g.count} pieces` : ''}`,
-                              ...(where && where !== g.label ? [where] : []),
-                              ...(lead === 'none' ? [] : [leadHint(lead, g)]),
-                            ].join('\n'),
-                            onPress: lead === 'none' ? undefined : () => void goTo(g),
-                          }
-                        }),
-                      ),
+                    : rows(details.map(g => entryRow(g, `d-${cat}`))),
                 ]
               })),
         ]
@@ -943,11 +1008,36 @@ export const register: Register = on => {
           ]),
           rows(turnTimeRows()),
           chart(toolsTable(r), 'Tools: calls, total and average time, result tokens'),
-          chart(slowChart(r), 'The slowest single tool calls'),
+          heading('Slowest single calls', 'From the call to its result; a call that waited for your approval includes that wait. Click one to see the call and what came back.'),
+          rows(
+            r.slowest.slice(0, 15).map((s, k) => {
+              const g: Group = {
+                cat: s.bucket === 't_terminal' ? 'cmd' : 'other_tools',
+                label: s.label,
+                cost: 0,
+                tokens: 0,
+                count: 1,
+                byTurn: { [s.turn]: 1 },
+                ref: s.toolUseId ? { toolUseId: s.toolUseId } : undefined,
+              }
+              const lead = leadOf(g)
+              return {
+                key: `slow-${k}`,
+                label: s.label,
+                segs: [{ v: s.ms, cls: 'write' }],
+                value: dur(s.ms),
+                title: [s.label, `Took ${dur(s.ms)} · turn ${s.turn}`, ...(lead === 'none' ? [] : [leadHint(lead, g)])].join('\n'),
+                onPress: lead === 'none' ? undefined : () => void goTo(g),
+              }
+            }),
+          ),
           ...(v.isContent ? [<Text dimColor>Time is not split by kind of content; only the turn filter applies here.</Text>] : []),
         ]
       } else if (current === 'top') {
-        body = [chart(itemChart(r), 'The single pieces of content that cost the most')]
+        body = [
+          heading('The single entries that cost the most', 'Every entry of every kind of content, each summed over its pieces (every read of a file, every call of a command). Click one to see it.'),
+          rows(topGroups(raw, v).map(g => entryRow(g, 'top', true))),
+        ]
       } else if (current === 'agents') {
         body = [chart(agentsTable(r), 'Subagents: requests, tokens, time and cost')]
       } else {
@@ -1051,6 +1141,18 @@ export const register: Register = on => {
 
       // what a details entry's click put on show: the file, script, output or skill itself
       const { Code, Markdown } = els
+      // a long preview shows a window of its lines, stepped with ▲ ▼, so the
+      // pane keeps its length (a Box clips but does not scroll); "Show all" lifts it
+      const lines = preview ? preview.source.split('\n') : []
+      const isWindowed = preview !== null && !preview.isExpanded && lines.length > PREVIEW_LINES
+      const first = isWindowed ? Math.min(Math.max(0, preview.offset ?? 0), lines.length - PREVIEW_LINES) : 0
+      const shownSource = isWindowed ? lines.slice(first, first + PREVIEW_LINES).join('\n') : (preview?.source ?? '')
+      const movePreview = async (change: (p: Preview) => Partial<Preview>) => {
+        const { value: now } = await $.state.get(PREVIEW)
+        if (now) await $.state.set(PREVIEW, { ...now, ...change(now) })
+      }
+      const step = (by: number) => () =>
+        void movePreview(p => ({ offset: Math.min(Math.max(0, (p.offset ?? 0) + by), Math.max(0, lines.length - PREVIEW_LINES)) }))
       const shown = preview ? (
         <Box flexDirection="column" marginTop={2} borderStyle="round" borderDimColor paddingX={1}>
           <Box flexDirection="row" justifyContent="space-between" alignItems="center" gap={1}>
@@ -1062,11 +1164,25 @@ export const register: Register = on => {
           {preview.note ? <Text dimColor>{preview.note}</Text> : null}
           <Box marginTop={1}>
             {preview.isMarkdown ? (
-              <Markdown text={preview.source} />
+              <Markdown text={shownSource} />
             ) : (
-              <Code source={preview.source} language={preview.language} path={preview.path} startLine={preview.path ? 1 : undefined} />
+              <Code source={shownSource} language={preview.language} path={preview.path} startLine={first + 1} />
             )}
           </Box>
+          {lines.length > PREVIEW_LINES ? (
+            <Box flexDirection="row" alignItems="center" gap={1} marginTop={1}>
+              {isWindowed ? (
+                <>
+                  <Button key="preview-up" label="▲" dimColor onPress={step(-PREVIEW_LINES)} />
+                  <Button key="preview-down" label="▼" dimColor onPress={step(PREVIEW_LINES)} />
+                  <Text dimColor>{`lines ${first + 1}–${Math.min(lines.length, first + PREVIEW_LINES)} of ${lines.length}`}</Text>
+                  <Button key="preview-all" label="Show all" dimColor onPress={() => void movePreview(() => ({ isExpanded: true }))} />
+                </>
+              ) : (
+                <Button key="preview-less" label="Show less" dimColor onPress={() => void movePreview(() => ({ isExpanded: false }))} />
+              )}
+            </Box>
+          ) : null}
         </Box>
       ) : null
 

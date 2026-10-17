@@ -69,7 +69,7 @@ export type ToolRow = {
   resultTokens: number
 }
 
-export type SlowCall = { label: string; ms: number; bucket: string; turn: number }
+export type SlowCall = { label: string; ms: number; bucket: string; turn: number; toolUseId?: string }
 
 export type TurnRow = {
   /** 1-based. */
@@ -152,6 +152,8 @@ export type LimitWindow = {
   /** How full the window is for the whole account, as the API reports it. */
   percentUsed: number
   resetsAt?: string
+  /** When the reading was taken, where it is an earlier one (another session's): the API sends none until this session's next reply. */
+  readAt?: number
   /** This session's part of it, in percentage points of the limit. */
   session?: number
   /** This session's cost inside the window. */
@@ -219,6 +221,10 @@ export type Preview = {
   isMarkdown?: boolean
   /** A dim line under the title: a command's description, a cut. */
   note?: string
+  /** The first line shown, 0-based, while the preview shows a window of its lines. */
+  offset?: number
+  /** All lines shown at once, not a window. */
+  isExpanded?: boolean
 }
 
 /** The background measurement of the limits' shares. */

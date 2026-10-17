@@ -156,12 +156,16 @@ export function applyFilter(r: UsageReport, f: Filter): UsageReport {
   }
 }
 
-/** The most expensive details entries of any kind, within the filter. */
-function topOf(r: UsageReport, v: View): TopItem[] {
+/** The most expensive details entries of any kind, within the filter, their cost the picked turns'. */
+export function topGroups(r: UsageReport, v: View, limit = 25): Group[] {
   return r.groups
     .filter(g => v.cats.size === 0 || v.cats.has(g.cat))
-    .map(g => ({ label: g.label, cat: g.cat, tokens: g.tokens, reads: g.count, processed: 0, cost: groupCost(g, v) }))
+    .map(g => ({ ...g, cost: groupCost(g, v) }))
     .filter(g => g.cost > 0.00005)
     .sort((a, b) => b.cost - a.cost)
-    .slice(0, 25)
+    .slice(0, limit)
+}
+
+function topOf(r: UsageReport, v: View): TopItem[] {
+  return topGroups(r, v).map(g => ({ label: g.label, cat: g.cat, tokens: g.tokens, reads: g.count, processed: 0, cost: g.cost }))
 }
