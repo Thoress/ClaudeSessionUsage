@@ -1,0 +1,2 @@
+# bash runs these: no CR at the line ends, on any checkout
+*.sh text eol=lf
