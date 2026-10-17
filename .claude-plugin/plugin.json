@@ -1,0 +1,8 @@
+{
+  "name": "session-insights",
+  "version": "0.2.0",
+  "description": "Shows where a Claude Code session's tokens, cost and time went: by content type, turn and activity, with caching, rate-limit shares and a footer summary.",
+  "author": { "name": "Thoress" },
+  "repository": "https://github.com/Thoress/ClaudeSessionUsage",
+  "types": "./types/index.d.ts"
+}

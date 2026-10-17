@@ -1,0 +1,7 @@
+# laid by Claude Code each time it loads the mod from a folder it watches
+.claude-plugin/types/
+
+# reports written by /session-usage export or the pane's export button
+session-usage-*.md
+
+node_modules/
