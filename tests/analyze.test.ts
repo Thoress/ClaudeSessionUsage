@@ -6,17 +6,13 @@ import {
   contextChart,
   costChart,
   cumulativeChart,
-  framed,
   infoIcon,
-  itemChart,
   miniBar,
   overviewTop,
   ring,
-  slowChart,
   summaryCard,
   timeChart,
   toolsTable,
-  tooltipCard,
 } from '../hooks/charts'
 import { NO_FILTER, applyFilter, detailsOf, viewOf } from '../hooks/filter'
 import { dur, money, tok, toMarkdown } from '../hooks/format'
@@ -168,9 +164,7 @@ describe('cost', () => {
       costChart(r),
       costChart(r, true),
       cumulativeChart(r),
-      itemChart(r),
       toolsTable(r),
-      slowChart(r),
       agentsTable(r),
       summaryCard(r),
     ]
@@ -401,17 +395,6 @@ describe('scan', () => {
 
 describe('footer', () => {
   const r = buildReport('s', 'f.jsonl', ROWS, [], T0 + 700_000)
-  test('the tooltip and the popover float on an opaque card', () => {
-    const tip = tooltipCard(r)
-    expect(tip.includes('class="cardbg"')).toBe(true)
-    expect(tip.includes('Session usage')).toBe(true)
-    expect(tip.includes('Click for details')).toBe(true)
-    const pop = framed(summaryCard(r), 'Session usage', 44)
-    // the card leaves 44px under the summary for the buttons laid over it
-    const inner = summaryCard(r).match(/height="(\d+)"/)![1]
-    expect(pop.match(/height="(\d+)"/)![1]).toBe(String(Number(inner) + 28 + 30 + 44))
-  })
-
   test('the popover card is compact: the width it is given, no taller than the app’s own', () => {
     const live = {
       ...r,

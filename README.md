@@ -33,12 +33,13 @@ claude plugin marketplace add F:\Programmieren\AI\ClaudeSessionUsage
 claude plugin install session-insights@claude-session-usage
 ```
 
-Check and test:
+Check and test, all in one go (stops at the first failure):
 
 ```
-claude plugin validate .
-claude plugin test .
+bash scripts/check.sh
 ```
+
+It runs `node scripts/check-state-refs.mjs`, then `claude plugin validate .` and `claude plugin test .`. The first checks a rule the runtime enforces but `validate` does not: a state reference (`const NAME = { plugin: '…', key: '…' } as const`) may only be passed to `$.state.get` / `$.state.set` (or spread into an object) in the file that defines it. Anything else, even `REPORT.plugin` in a comparison or importing it from another file, and the runtime refuses to load the whole module.
 
 ## How it measures
 

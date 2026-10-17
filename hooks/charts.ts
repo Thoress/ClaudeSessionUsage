@@ -1,15 +1,14 @@
 // SVG charts for the surfaces that draw them (desktop, VS Code, mobile).
 //
-// Each chart is one self-contained SVG: its title, an (i) icon whose card
-// explains it, the marks, and a styled tooltip card per mark, shown with CSS
-// :hover inside the Svg element's frame (no script). Colour: the reference
+// Each chart is one self-contained SVG: its title, an (i) icon whose tooltip
+// explains it, the marks, and a hover target per mark whose tooltip is a
+// plain SVG <title> (no script, no card drawn inside). Colour: the reference
 // palette's first three categorical slots, validated all-pairs for colour-
 // vision deficiency in light and dark: blue = served from the cache, aqua =
 // new input written to the cache, orange = output. Text always wears the text
 // tokens, never a series colour.
 
 import type { LimitWindow, Measure, RequestPoint, UsageReport } from '../types'
-import { CATS } from './analyze'
 import { cachingText, dur, money, pct, tok } from './format'
 
 let W = 720
@@ -91,10 +90,8 @@ export function wrap(s: string, max: number): string[] {
 // SVG <title>. A card drawn inside the SVG could not leave a small picture's
 // frame (the (i) beside a heading, a row's bar), so it is used nowhere.
 
-type TipLine = { swatch?: string; label: string; value?: string }
+type TipLine = { label: string; value?: string }
 type Tip = { title: string; lines?: TipLine[]; text?: string }
-/** Where a card would go; kept so callers read the same. */
-type Anchor = { x: number; top: number; bottom: number; place: 'side' | 'row' }
 
 /** `as of 12m ago` for a limit read earlier by another session; undefined for this session's own reading. */
 export const readAgo = (l: LimitWindow, now: number) =>
@@ -136,7 +133,7 @@ class Canvas {
   }
 
   /** A transparent target that shows `tip` while the pointer is on it. */
-  hover(x: number, y: number, w: number, h: number, tip: Tip, _at: Anchor) {
+  hover(x: number, y: number, w: number, h: number, tip: Tip) {
     const id = this.next++
     this.parts.push(
       `<rect x="${n1(x)}" y="${n1(y)}" width="${n1(Math.max(1, w))}" height="${n1(Math.max(1, h))}" class="hit h${id}"><title>${esc(tipText(tip))}</title></rect>`,
@@ -241,8 +238,8 @@ export function overviewTop(r: UsageReport, opts: { isContent?: boolean; measure
           `This session's part is that figure split by cost: this session's requests inside the window, against every Claude Code session on this computer inside the same window, all priced at API list prices. ` +
           `Usage elsewhere (claude.ai, other devices) is not in the local transcripts and makes this session's part read high.`,
         lines: [
-          { swatch: 'read', label: 'This session', value: hasShare ? `≈ ${mine.toFixed(1)}% · ${money(l.sessionUsd ?? 0)}` : pending },
-          { swatch: 'other', label: `Everything else${l.sessions ? ` (${Math.max(0, l.sessions - 1)} other sessions)` : ''}`, value: hasShare ? `≈ ${(l.percentUsed - mine).toFixed(1)}% · ${money(Math.max(0, (l.totalUsd ?? 0) - (l.sessionUsd ?? 0)))}` : '' },
+          { label: 'This session', value: hasShare ? `≈ ${mine.toFixed(1)}% · ${money(l.sessionUsd ?? 0)}` : pending },
+          { label: `Everything else${l.sessions ? ` (${Math.max(0, l.sessions - 1)} other sessions)` : ''}`, value: hasShare ? `≈ ${(l.percentUsed - mine).toFixed(1)}% · ${money(Math.max(0, (l.totalUsd ?? 0) - (l.sessionUsd ?? 0)))}` : '' },
           { label: 'Used in all', value: `${l.percentUsed.toFixed(1)}%` },
           ...(l.resetsAt ? [{ label: 'Window', value: resets(l.resetsAt) }] : []),
         ],
@@ -260,9 +257,9 @@ export function overviewTop(r: UsageReport, opts: { isContent?: boolean; measure
         title: 'What this session would cost on the API',
         text: `At ${p.isKnown ? p.model : 'Claude Opus 5.5'} list prices: input $${p.input}/M, output $${p.output}/M, cache reads $${p.read}/M, cache writes $${p.input * 1.25}/M (5-minute) or $${p.input * 2}/M (1-hour). On a subscription nothing is billed per token; the figure weighs the parts the way the API does.`,
         lines: [
-          { swatch: 'read', label: 'Cache reads', value: money(r.cost.read) },
-          { swatch: 'write', label: 'Cache writes', value: money(r.cost.write + r.cost.uncached) },
-          { swatch: 'out', label: 'Output', value: money(r.cost.output) },
+          { label: 'Cache reads', value: money(r.cost.read) },
+          { label: 'Cache writes', value: money(r.cost.write + r.cost.uncached) },
+          { label: 'Output', value: money(r.cost.output) },
           { label: 'Without caching it would be', value: money(r.cost.noCache) },
           { label: 'Caching saved', value: pct(r.cost.noCache - r.cost.total, r.cost.noCache) },
         ],
@@ -276,9 +273,9 @@ export function overviewTop(r: UsageReport, opts: { isContent?: boolean; measure
         title: 'Input, summed over all requests',
         text: 'Every request sends the whole conversation again, so the same content is counted once per request.',
         lines: [
-          { swatch: 'read', label: 'Read from the cache', value: tok(r.input.cacheRead) },
-          { swatch: 'write', label: 'New, written to the cache', value: tok(r.input.cacheWrite + r.input.uncached) },
-          { swatch: 'out', label: 'Output (incl. thinking)', value: tok(r.output.total) },
+          { label: 'Read from the cache', value: tok(r.input.cacheRead) },
+          { label: 'New, written to the cache', value: tok(r.input.cacheWrite + r.input.uncached) },
+          { label: 'Output (incl. thinking)', value: tok(r.output.total) },
           { label: 'of it thinking', value: tok(r.output.thinking) },
         ],
       },
@@ -337,7 +334,7 @@ export function overviewTop(r: UsageReport, opts: { isContent?: boolean; measure
       } else c.add(rect(x + 16, y + 70, Math.max(2, bw * used), 6, isHigh ? 'crit' : 'read', 'none'))
     }
     c.add(text(x + 16, y + 94, cut(tile.sub, Math.floor((tw - 24) / 6.8)), 't3 f13'))
-    c.hover(x, y, tw, th, tile.tip, { x: x + 8, top: y, bottom: y + th, place: 'row' })
+    c.hover(x, y, tw, th, tile.tip)
   })
   const y0 = (th + gap) * Math.ceil(tiles.length / perRow) + 26
 
@@ -385,10 +382,9 @@ export function overviewTop(r: UsageReport, opts: { isContent?: boolean; measure
       {
         title: label === 'Tokens' ? 'Where the tokens went' : 'Where the money went',
         lines: vals
-          .map((v, k) => ({ swatch: cls[k], label: names[k]!, value: `${fmt(v)} · ${pct(v, total)}` }))
+          .map((v, k) => ({ label: names[k]!, value: `${fmt(v)} · ${pct(v, total)}` }))
           .filter(l => l.label !== ''),
       },
-      { x: labelW, top: y, bottom: y + 30, place: 'row' },
     )
   })
   return c.finish(y0 + 42 + 2 * 42)
@@ -428,7 +424,7 @@ function rowChart(title: string, info: string | undefined, legendItems: [string,
       x += w
     })
     c.add(text(x + 8, y + 19, row.value, 't2 f13'))
-    c.hover(0, y, W, rowH, row.tip, { x: Math.min(x + 8, W - 200), top: y, bottom: y + rowH, place: 'row' })
+    c.hover(0, y, W, rowH, row.tip)
   })
   if (footer) c.footer(y0 + rows.length * rowH + 20, footer)
   return c.finish(y0 + rows.length * rowH + (footer ? 28 : 4))
@@ -456,68 +452,19 @@ export function timeChart(r: UsageReport, limit = 30, title = 'Where the time we
   )
 }
 
-/** Each turn's cost split by what it paid for, and the card that tells it. */
+/** Each turn's cost split by what it paid for. */
 export function turnCosts(r: UsageReport) {
   return r.turnRows.map((t, k) => {
     const pts = r.series.filter(p => p.turn === k + 1)
     const read = sum(pts, p => p.costRead)
     const write = sum(pts, p => p.costWrite)
     const out = sum(pts, p => p.costOutput)
-    const tip: Tip = {
-      title: `${k + 1}. ${cut(t.prompt, 110)}`,
-      lines: [
-        { swatch: 'read', label: `Cache reads · ${tok(t.cacheRead)}`, value: money(read) },
-        { swatch: 'write', label: `Cache writes · ${tok(t.cacheWrite)}`, value: money(write) },
-        { swatch: 'out', label: `Output · ${tok(t.outputTokens)}`, value: money(out) },
-        { label: 'Total', value: money(t.cost) },
-        { label: 'Active time', value: dur(t.activeMs) },
-        { label: 'Model requests', value: String(t.requests) },
-        { label: 'Context at the end', value: tok(t.contextAtEnd) },
-      ],
-    }
-    return { t, k, read, write, out, tip }
+    return { t, k, read, write, out }
   })
 }
 
 export const TURN_INFO =
   'A turn is everything Claude did for one of your prompts (or for a background task that woke the session). Later turns cost more per request because the context they re-send is bigger.'
-
-/** The single pieces of content that cost the most. */
-export function itemChart(r: UsageReport, limit = 25): string {
-  const rows = r.top.slice(0, limit).map(t => ({
-    label: t.label,
-    segs: [{ v: t.cost, cls: 'read' }],
-    value: `${money(t.cost)}${t.reads > 1 ? ` · ${t.reads} pieces` : ''}`,
-    tip: {
-      title: cut(t.label, 120),
-      lines: [
-        { label: 'Kind', value: CATS[t.cat]?.label ?? t.cat },
-        { label: 'Tokens added to the context', value: tok(t.tokens) },
-        ...(t.reads > 1 ? [{ label: 'Pieces (reads, calls, edits)', value: String(t.reads) }] : []),
-        { label: 'Cost', value: money(t.cost) },
-      ],
-    },
-  }))
-  return rowChart(
-    'Most expensive single items',
-    'Content summed by what it is: a file (all its reads and edits), a command, a skill, a reminder. Each piece stays in the context and is re-sent with every later request until a compaction drops it, so its cost is its first write to the cache plus every re-read, plus the output where Claude wrote it.',
-    undefined,
-    rows,
-    0.44,
-    170,
-  )
-}
-
-/** The slowest single tool calls. */
-export function slowChart(r: UsageReport, limit = 12): string {
-  const rows = r.slowest.slice(0, limit).map(s => ({
-    label: s.label,
-    segs: [{ v: s.ms, cls: 'read' }],
-    value: dur(s.ms),
-    tip: { title: cut(s.label, 120), lines: [{ label: 'Took', value: dur(s.ms) }] },
-  }))
-  return rowChart('Slowest single calls', 'From the call to its result. A call that waited for your approval includes that wait.', undefined, rows, 0.5, 80)
-}
 
 // ---------- tables ----------
 
@@ -546,7 +493,7 @@ function table(title: string, info: string | undefined, cols: Col[], rows: { cel
       const room = Math.floor((edge(k) - xs[k]! - 14) / 7.2)
       c.add(text(xOf(k), y + 19, cut(cell, room), `${k === 0 ? 't' : 't f13'}${cols[k]!.align === 'right' ? ' e' : ''}`))
     })
-    if (row.tip) c.hover(0, y, W, rowH, row.tip, { x: 8, top: y, bottom: y + rowH, place: 'row' })
+    if (row.tip) c.hover(0, y, W, rowH, row.tip)
   })
   c.add(`<line x1="0" x2="${W}" y1="${y0 + rowH}" y2="${y0 + rowH}" class="base"/>`)
   cols.forEach((col, k) => {
@@ -554,7 +501,7 @@ function table(title: string, info: string | undefined, cols: Col[], rows: { cel
     const x = xOf(k)
     c.add(text(x, y0 + 20, col.label, `t2 f13 b${isRight ? ' e' : ''}`))
     const w = col.label.length * 7.6
-    c.hover(isRight ? x - w - 4 : x - 4, y0 + 2, w + 8, rowH - 4, { title: col.label, text: col.tip }, { x: isRight ? x - w : x, top: y0, bottom: y0 + rowH, place: 'row' })
+    c.hover(isRight ? x - w - 4 : x - 4, y0 + 2, w + 8, rowH - 4, { title: col.label, text: col.tip })
   })
   return c.finish(y0 + rowH * (rows.length + 1) + 6)
 }
@@ -683,13 +630,12 @@ export function contextChart(r: UsageReport, isContent = false): string {
       {
         title: colTitle(col),
         lines: [
-          { swatch: 'read', label: 'Read from the cache', value: tok(p.read) },
-          { swatch: col.isBreak ? 'crit' : 'write', label: col.isBreak ? 'Written again (rebuild)' : 'New, written', value: tok(p.write) },
+          { label: 'Read from the cache', value: tok(p.read) },
+          { label: col.isBreak ? 'Written again (rebuild)' : 'New, written', value: tok(p.write) },
           { label: 'Context size', value: tok(p.read + p.write) },
           { label: 'Cost', value: money(sum(col.pts, q => q.costRead + q.costWrite + q.costOutput)) },
         ],
       },
-      { x: x + pl.barW / 2, top: pl.top + 20, bottom: pl.bottom, place: 'side' },
     )
   })
   return c.finish(pl.bottom + 6)
@@ -749,13 +695,12 @@ export function costChart(r: UsageReport, isContent = false): string {
       {
         title: colTitle(col),
         lines: [
-          { swatch: 'read', label: `Cache reads · ${tok(sum(col.pts, p => p.read))}`, value: money(v.read) },
-          { swatch: 'write', label: `Cache writes · ${tok(sum(col.pts, p => p.write))}`, value: money(v.write) },
-          { swatch: 'out', label: `Output · ${tok(sum(col.pts, p => p.output))}`, value: money(v.out) },
+          { label: `Cache reads · ${tok(sum(col.pts, p => p.read))}`, value: money(v.read) },
+          { label: `Cache writes · ${tok(sum(col.pts, p => p.write))}`, value: money(v.write) },
+          { label: `Output · ${tok(sum(col.pts, p => p.output))}`, value: money(v.out) },
           { label: 'Total', value: money(v.read + v.write + v.out) },
         ],
       },
-      { x: x + pl.barW / 2, top: pl.top + 20, bottom: pl.bottom, place: 'side' },
     )
   })
   return c.finish(pl.bottom + 6)
@@ -776,12 +721,7 @@ export function cumulativeChart(r: UsageReport): string {
   c.add(text(W - 2, pl.bottom - ((pl.bottom - pl.top) * acc) / max - 8, money(acc), 't b e'))
   cols.forEach((col, k) => {
     const x = pl.x0 + k * pl.step
-    c.hover(x - 1, pl.top, pl.step + 1, pl.bottom - pl.top, { title: colTitle(col), lines: [{ label: 'Cost so far', value: money(cum[k]!) }] }, {
-      x: x + pl.barW / 2,
-      top: pl.top,
-      bottom: pl.bottom,
-      place: 'side',
-    })
+    c.hover(x - 1, pl.top, pl.step + 1, pl.bottom - pl.top, { title: colTitle(col), lines: [{ label: 'Cost so far', value: money(cum[k]!) }] })
   })
   return c.finish(pl.bottom + 6)
 }
@@ -926,56 +866,4 @@ export function summaryCard(r: UsageReport, measure?: Measure, width = 380): str
   }
   const h = y - 4
   return `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 ${w} ${h}" width="${w}" height="${h}" font-family="system-ui, -apple-system, Segoe UI, sans-serif">${STYLE}${body}</svg>`
-}
-
-// ---------- the footer's tooltip and popover ----------
-
-const CARD_STYLE = `<style>${NO_SELECT}.cardbg{fill:#ffffff;stroke:#d6d5d0}.ct{fill:#0b0b0b}.ct2{fill:#52514e}.ct3{fill:#7a7975}
-@media (prefers-color-scheme: dark){.cardbg{fill:#2b2b29;stroke:#4a4a46}.ct{fill:#ffffff}.ct2{fill:#c3c2b7}.ct3{fill:#9a9990}}</style>`
-
-/**
- * An SVG drawn on an opaque card with a title, so it can float over the
- * conversation; `footer` leaves room at the bottom for buttons laid over it.
- */
-export function framed(inner: string, title?: string, footer = 0): string {
-  const { width, height } = svgSize(inner)
-  const pad = 14
-  const head = title ? 30 : 0
-  const w = width + 2 * pad
-  const h = height + 2 * pad + head + footer
-  return (
-    `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 ${w} ${h}" width="${w}" height="${h}" font-family="system-ui, -apple-system, Segoe UI, sans-serif">` +
-    CARD_STYLE +
-    `<rect x="0.5" y="0.5" width="${w - 1}" height="${h - 1}" rx="10" class="cardbg"/>` +
-    (title ? `<text x="${pad}" y="${pad + 14}" font-size="15" font-weight="600" class="ct">${esc(title)}</text>` : '') +
-    inner.replace('<svg ', `<svg x="${pad}" y="${pad + head}" `) +
-    `</svg>`
-  )
-}
-
-/** The short summary shown while the pointer is on the footer's icon. */
-export function tooltipCard(r: UsageReport): string {
-  const lines: [string, string][] = [['Cost (API prices)', money(r.cost.total)]]
-  for (const [kind, name] of [
-    ['five_hour', '5-hour limit'],
-    ['seven_day', 'Weekly limit'],
-  ] as const) {
-    const l = r.live?.limits.find(x => x.kind === kind)
-    if (l) lines.push([`${name}, this session`, l.session === undefined ? '…' : `≈ ${l.session < 10 ? l.session.toFixed(1) : Math.round(l.session)}% of ${Math.round(l.percentUsed)}%`])
-  }
-  if (r.live) {
-    const ctx = r.live.contextPercent ?? (100 * (r.live.contextTokens ?? r.contextNow)) / Math.max(1, r.live.contextWindow)
-    lines.push(['Context', `${Math.round(ctx)}%`])
-  }
-  lines.push(['Active', dur(sum(r.time.filter(t => t.id !== 'idle'), t => t.ms))])
-  const w = 260
-  const rowH = 21
-  let body = ''
-  lines.forEach(([label, value], k) => {
-    body += `<text x="0" y="${14 + k * rowH}" font-size="13" class="ct2">${esc(label)}</text>`
-    body += `<text x="${w}" y="${14 + k * rowH}" font-size="13" font-weight="600" text-anchor="end" class="ct">${esc(value)}</text>`
-  })
-  body += `<text x="0" y="${14 + lines.length * rowH + 4}" font-size="12" class="ct3">Click for details</text>`
-  const inner = `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 ${w} ${lines.length * rowH + 26}" width="${w}" height="${lines.length * rowH + 26}">${body}</svg>`
-  return framed(inner, 'Session usage')
 }
