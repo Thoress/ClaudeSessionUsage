@@ -208,6 +208,19 @@ export type UsageReport = {
 /** What the pane shows: the turns and kinds of content picked; empty means all. */
 export type Filter = { turns: number[]; cats: string[] }
 
+/** Something the pane shows in full: a file, a script, its output, a skill, a message. */
+export type Preview = {
+  title: string
+  source: string
+  /** A highlighter language id; absent, inferred from `path`. */
+  language?: string
+  path?: string
+  /** Drawn as markdown (a skill, a prompt, a reply) rather than as code. */
+  isMarkdown?: boolean
+  /** A dim line under the title: a command's description, a cut. */
+  note?: string
+}
+
 /** The background measurement of the limits' shares. */
 export type Measure = { state: 'idle' | 'measuring' | 'error'; files?: number; error?: string }
 
@@ -223,6 +236,8 @@ declare module 'claude-code' {
       measure: Measure
       /** Whether the footer's popover is open. */
       popover: boolean
+      /** What a details entry's click put on show in the pane. */
+      preview: Preview | null
     }
   }
 }

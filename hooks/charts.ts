@@ -28,18 +28,21 @@ export function svgSize(source: string): { width: number; height: number } {
 const MAX_SOURCE = 131_072
 const MAX_COLUMNS = 80
 
-const STYLE = `<style>
+// pictures, not text: the arrow cursor, nothing to select
+const NO_SELECT = 'svg,text{cursor:default;user-select:none;-webkit-user-select:none}'
+
+const STYLE = `<style>${NO_SELECT}
 text{font-size:14px}.f12{font-size:12px}.f13{font-size:13px}.f16{font-size:16px}.f30{font-size:30px}.b{font-weight:600}.e{text-anchor:end}.m{text-anchor:middle}
 .t{fill:#0b0b0b}.t2{fill:#52514e}.t3{fill:#7a7975}.grid{stroke:#e9e8e4}.base{stroke:#c9c8c3}.turnl{stroke:#b5b4ae}
 .read{fill:#2a78d6}.write{fill:#1baf7a}.out{fill:#eb6834}.other{fill:#c9c8c3}.crit{fill:#d03b3b}.line{stroke:#2a78d6;fill:none}
 .tile{fill:#f4f3f0}.zebra{fill:#f6f5f2}.track{fill:#e2e1dc}
 .hit{fill:transparent;cursor:default}.hit:hover{fill:rgba(127,127,127,.12)}
-.ic{fill:none;stroke:#8f8e88}.ict{fill:#8f8e88;font-weight:400}.icon:hover .ic{stroke:#2a78d6}.icon:hover .ict{fill:#2a78d6}
-.tip{display:none;pointer-events:none}.tipbg{fill:#ffffff;stroke:#d6d5d0;filter:drop-shadow(0 3px 8px rgba(0,0,0,.18))}
+.ic{fill:none;stroke:#8f8e88}.ict{fill:#8f8e88}.icon:hover .ic{stroke:#2a78d6}.icon:hover .ict{fill:#2a78d6}
+
 @media (prefers-color-scheme: dark){
 .t{fill:#ffffff}.t2{fill:#c3c2b7}.t3{fill:#9a9990}.grid{stroke:#2f2f2c}.base{stroke:#55544f}.turnl{stroke:#5a5954}
 .read{fill:#3987e5}.write{fill:#199e70}.out{fill:#d95926}.other{fill:#55544f}.line{stroke:#3987e5}
-.tile{fill:#242422}.zebra{fill:#20201e}.track{fill:#3a3a37}.tipbg{fill:#2b2b29;stroke:#4a4a46;filter:drop-shadow(0 3px 10px rgba(0,0,0,.5))}
+.tile{fill:#242422}.zebra{fill:#20201e}.track{fill:#3a3a37}
 .ic{stroke:#8f8e88}.ict{fill:#8f8e88}.icon:hover .ic{stroke:#3987e5}.icon:hover .ict{fill:#3987e5}}
 </style>`
 
@@ -82,19 +85,28 @@ export function wrap(s: string, max: number): string[] {
   return out
 }
 
-// ---------- the tooltip card ----------
+// ---------- tooltips and the (i) icon ----------
+//
+// Every hover in the mod shows the same thing: the system's tooltip, from an
+// SVG <title>. A card drawn inside the SVG could not leave a small picture's
+// frame (the (i) beside a heading, a row's bar), so it is used nowhere.
 
 type TipLine = { swatch?: string; label: string; value?: string }
 type Tip = { title: string; lines?: TipLine[]; text?: string }
-/** Where a card goes: beside a column, or under (else over) a row. */
+/** Where a card would go; kept so callers read the same. */
 type Anchor = { x: number; top: number; bottom: number; place: 'side' | 'row' }
 
-const PAD = 10
-const LINE = 19
+const tipText = (t: Tip) =>
+  [t.title, t.text, ...(t.lines ?? []).map(l => (l.value ? `${l.label}: ${l.value}` : l.label))].filter(Boolean).join('\n')
+
+/** The (i) icon at (x, y), its top left, 18px square; hovering it shows `info`. */
+const infoMark = (x: number, y: number, info: string) =>
+  `<g class="icon"><title>${esc(info)}</title><rect x="${n1(x)}" y="${n1(y)}" width="18" height="18" fill="transparent"/>` +
+  `<circle cx="${n1(x + 9)}" cy="${n1(y + 9)}" r="7" class="ic" stroke-width="1.4"/>` +
+  `<text x="${n1(x + 9)}" y="${n1(y + 13)}" text-anchor="middle" font-size="11" font-weight="700" class="ict">i</text></g>`
 
 class Canvas {
   private parts: string[] = []
-  private tips: { id: number; tip: Tip; at: Anchor }[] = []
   private next = 0
 
   add(s: string) {
@@ -102,24 +114,18 @@ class Canvas {
   }
 
   /** A transparent target that shows `tip` while the pointer is on it. */
-  hover(x: number, y: number, w: number, h: number, tip: Tip, at: Anchor) {
+  hover(x: number, y: number, w: number, h: number, tip: Tip, _at: Anchor) {
     const id = this.next++
-    this.parts.push(`<rect x="${n1(x)}" y="${n1(y)}" width="${n1(Math.max(1, w))}" height="${n1(Math.max(1, h))}" class="hit h${id}"/>`)
-    this.tips.push({ id, tip, at })
+    this.parts.push(
+      `<rect x="${n1(x)}" y="${n1(y)}" width="${n1(Math.max(1, w))}" height="${n1(Math.max(1, h))}" class="hit h${id}"><title>${esc(tipText(tip))}</title></rect>`,
+    )
   }
 
-  /**
-   * A chart title with an (i) after it whose card holds `info`. The icon is a
-   * tspan of the title's own text, so it follows the title's real width.
-   */
+  /** A chart title, with the (i) icon after it whose tooltip holds `info`. */
   title(s: string, info?: string, y = 18) {
-    if (!info) {
-      this.add(text(0, y, s, 't f16 b'))
-      return
-    }
-    const id = this.next++
-    this.add(`<text x="0" y="${y}" class="t f16 b icon h${id}">${esc(s)}<tspan dx="8" class="ict">ⓘ</tspan></text>`)
-    this.tips.push({ id, tip: { title: s, text: info }, at: { x: 0, top: y - 16, bottom: y + 6, place: 'row' } })
+    this.add(text(0, y, s, 't f16 b'))
+    // the title's width, estimated: about 0.56em a character at 16px, semibold
+    if (info) this.add(infoMark(s.length * 8.9 + 8, y - 14, `${s}\n\n${info}`))
   }
 
   /** A dim line under the chart. */
@@ -135,74 +141,14 @@ class Canvas {
     }
   }
 
-  private size(t: Tip, maxW: number): { w: number; h: number; body: (w: number) => string } {
-    const titleLines = wrap(t.title, Math.floor((maxW - 2 * PAD) / 8))
-    const textLines = t.text ? wrap(t.text, Math.floor((maxW - 2 * PAD) / 7)) : []
-    const lines = t.lines ?? []
-    const lineW = Math.max(0, ...lines.map(l => (l.swatch ? 20 : 0) + l.label.length * 7.1 + (l.value ? l.value.length * 7.6 + 24 : 0)))
-    const w = Math.min(maxW, Math.max(140, lineW + 2 * PAD, textLines.length ? maxW : 0, ...titleLines.map(l => l.length * 8 + 2 * PAD)))
-    const textH = sum(textLines, l => (l ? 18 : 8))
-    const h = PAD * 2 + titleLines.length * LINE + (textLines.length ? 4 + textH : 0) + lines.length * LINE
-    const body = (w: number) => {
-      let out = `<rect x="0" y="0" width="${n1(w)}" height="${n1(h)}" rx="8" class="tipbg"/>`
-      let y = PAD + 14
-      for (const l of titleLines) {
-        out += text(PAD, y, l, 't b')
-        y += LINE
-      }
-      if (textLines.length) y += 4
-      for (const l of textLines) {
-        if (l) out += text(PAD, y, l, 't2 f13')
-        y += l ? 18 : 8
-      }
-      for (const l of lines) {
-        let x = PAD
-        if (l.swatch) {
-          out += rect(x, y - 10, 11, 11, l.swatch, 'all')
-          x += 19
-        }
-        out += text(x, y, l.label, 't2 f13')
-        if (l.value) out += text(w - PAD, y, l.value, 't f13 b e')
-        y += LINE
-      }
-      return out
-    }
-    return { w, h, body }
-  }
-
-  /** The whole SVG; grown, where a card would not fit, to hold it. */
+  /** The whole SVG. */
   finish(height: number): string {
-    // a card takes the narrowest of these widths at which it fits the chart's own height
-    const widths = [460, 580, W - 8].map(w => Math.min(W - 8, w))
-    const sized = this.tips.map(t => {
-      const fit = widths.map(w => this.size(t.tip, w)).find(s => s.h + 6 <= height)
-      return { ...t, ...(fit ?? this.size(t.tip, widths[2]!)) }
-    })
-    const H = Math.ceil(Math.max(height, ...sized.map(t => t.h + 6)))
-    let tips = ''
-    const rules: string[] = []
-    for (const t of sized) {
-      let x: number
-      let y: number
-      if (t.at.place === 'side') {
-        x = t.at.x + 14 + t.w <= W ? t.at.x + 14 : t.at.x - 14 - t.w
-        y = t.at.top
-      } else {
-        x = t.at.x
-        y = t.at.bottom + 4 + t.h <= H ? t.at.bottom + 4 : t.at.top - 4 - t.h
-      }
-      x = Math.max(2, Math.min(W - t.w - 2, x))
-      y = Math.max(2, Math.min(H - t.h - 2, y))
-      tips += `<g class="tip t${t.id}" transform="translate(${n1(x)},${n1(y)})">${t.body(t.w)}</g>`
-      rules.push(`.h${t.id}:hover~.tips .t${t.id}`)
-    }
-    const css = rules.length ? `<style>${rules.join(',')}{display:inline}</style>` : ''
+    const H = Math.ceil(height)
     return (
       `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 ${W} ${H}" width="${W}" height="${H}" font-family="system-ui, -apple-system, Segoe UI, sans-serif">` +
       STYLE +
-      css +
       this.parts.join('') +
-      `<g class="tips">${tips}</g></svg>`
+      `</svg>`
     )
   }
 }
@@ -822,8 +768,8 @@ export function fits(source: string): string {
 
 // ---------- small pictures for the pane's native rows and the footer ----------
 
-const SMALL_STYLE = `<style>.read{fill:#2a78d6}.write{fill:#1baf7a}.out{fill:#eb6834}.other{fill:#c9c8c3}.track{fill:#e8e7e3}.ring{stroke:#2a78d6}.ringt{stroke:#d9d8d3}.ic{fill:none;stroke:#8f8e88}.ict{fill:#8f8e88}.sel{fill:none;stroke:#2a78d6}
-@media (prefers-color-scheme: dark){.read{fill:#3987e5}.write{fill:#199e70}.out{fill:#d95926}.other{fill:#55544f}.track{fill:#2c2c2a}.ring{stroke:#3987e5}.ringt{stroke:#3a3a37}.ic{stroke:#9a9990}.ict{fill:#9a9990}.sel{stroke:#3987e5}}</style>`
+const SMALL_STYLE = `<style>${NO_SELECT}.read{fill:#2a78d6}.write{fill:#1baf7a}.out{fill:#eb6834}.other{fill:#c9c8c3}.track{fill:#e8e7e3}.ring{stroke:#2a78d6}.ringt{stroke:#d9d8d3}.ic{fill:none;stroke:#8f8e88}.ict{fill:#8f8e88}.icon:hover .ic{stroke:#2a78d6}.icon:hover .ict{fill:#2a78d6}.sel{fill:none;stroke:#2a78d6}
+@media (prefers-color-scheme: dark){.read{fill:#3987e5}.write{fill:#199e70}.out{fill:#d95926}.other{fill:#55544f}.track{fill:#2c2c2a}.ring{stroke:#3987e5}.ringt{stroke:#3a3a37}.ic{stroke:#9a9990}.ict{fill:#9a9990}.icon:hover .ic{stroke:#3987e5}.icon:hover .ict{fill:#3987e5}.sel{stroke:#3987e5}}</style>`
 
 const small = (w: number, h: number, body: string, title?: string, opacity = 1) =>
   `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 ${w} ${h}" width="${w}" height="${h}" font-family="system-ui, sans-serif">${SMALL_STYLE}` +
@@ -848,7 +794,7 @@ export function miniBar(segs: { v: number; cls: string }[], max: number, width: 
 
 /** The (i) beside a heading: hovering it shows `info`. */
 export function infoIcon(info: string): string {
-  return small(18, 18, `<circle cx="9" cy="9" r="7" class="ic" stroke-width="1.4"/><text x="9" y="13" text-anchor="middle" font-size="11" font-weight="700" class="ict">i</text>`, info)
+  return small(18, 18, infoMark(0, 0, info))
 }
 
 /** A legend strip for native rows. */
@@ -954,7 +900,7 @@ export function summaryCard(r: UsageReport, measure?: Measure, width = 380): str
 
 // ---------- the footer's tooltip and popover ----------
 
-const CARD_STYLE = `<style>.cardbg{fill:#ffffff;stroke:#d6d5d0}.ct{fill:#0b0b0b}.ct2{fill:#52514e}.ct3{fill:#7a7975}
+const CARD_STYLE = `<style>${NO_SELECT}.cardbg{fill:#ffffff;stroke:#d6d5d0}.ct{fill:#0b0b0b}.ct2{fill:#52514e}.ct3{fill:#7a7975}
 @media (prefers-color-scheme: dark){.cardbg{fill:#2b2b29;stroke:#4a4a46}.ct{fill:#ffffff}.ct2{fill:#c3c2b7}.ct3{fill:#9a9990}}</style>`
 
 /**

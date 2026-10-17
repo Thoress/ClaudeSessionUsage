@@ -1,6 +1,6 @@
 import type { EngineInterface, Register } from 'claude-code'
 
-import type { Filter, Group, LimitWindow, LiveUsage, Measure, UsageReport } from '../types'
+import type { Filter, Group, LimitWindow, LiveUsage, Measure, Preview, UsageReport } from '../types'
 import { BUCKETS, CATS, buildReport, parseJsonl } from './analyze'
 import {
   TURN_INFO,
@@ -38,6 +38,7 @@ const STATUS = { plugin: 'session-insights', key: 'status' } as const
 const FILTER = { plugin: 'session-insights', key: 'filter' } as const
 const MEASURE = { plugin: 'session-insights', key: 'measure' } as const
 const POPOVER = { plugin: 'session-insights', key: 'popover' } as const
+const PREVIEW = { plugin: 'session-insights', key: 'preview' } as const
 
 const FS_READ_LIMIT = 4 * 1024 * 1024
 
@@ -337,6 +338,7 @@ async function refreshPane($: EngineInterface, sessionId: string): Promise<Usage
       r = await analyze($, sessionId)
       await $.state.set(REPORT, r)
       await $.state.set(FILTER, NO_FILTER)
+      await $.state.set(PREVIEW, null)
     }
     if (!r) throw new Error(`No transcript found for session ${sessionId}.`)
     await $.state.set(STATUS, '')
@@ -365,9 +367,12 @@ async function closePopover($: EngineInterface) {
   if (isOpen) await $.state.set(POPOVER, false)
 }
 
-// ---------- leading from a details entry to what it was ----------
+/// ---------- leading from a details entry to what it was ----------
 
-const FILE_CATS = /^(code|doc)_(read|write)$|^skills$/
+const FILE_CATS = /^(code|doc)_(read|write)$/
+/** Kinds whose entry is best seen whole: a command, its output, a skill, a tool's call and result. */
+const SHOW_CATS = /^(cmd|script|termout|search|skills|mcp|other_tools|agents|web|compaction)$/
+const PREVIEW_CHARS = 60_000
 
 /** The first turn an entry cost anything in. */
 const firstTurn = (g: Group) =>
@@ -376,23 +381,25 @@ const firstTurn = (g: Group) =>
     .map(([t]) => Number(t))
     .sort((a, b) => a - b)[0]
 
-type Lead = 'file' | 'page' | 'row' | 'turn' | 'none'
+type Lead = 'file' | 'page' | 'show' | 'jump' | 'none'
 
 /** Where a click on the entry leads; `isLive` when the pane shows the running session. */
 function leadOf(g: Group, isLive: boolean): Lead {
   if (g.ref?.path && FILE_CATS.test(g.cat)) return 'file'
   if (g.ref?.url) return 'page'
-  if (isLive && (g.ref?.toolUseId || g.ref?.messageId)) return 'row'
-  return firstTurn(g) === undefined ? 'none' : 'turn'
+  if (SHOW_CATS.test(g.cat) && (g.ref?.toolUseId || g.ref?.messageId)) return 'show'
+  if (isLive && firstTurn(g) !== undefined) return 'jump'
+  return g.ref?.messageId ? 'show' : 'none'
 }
 
-const LEAD_HINT: Record<Lead, string> = {
-  file: 'Click to open the file',
-  page: 'Click to open the page',
-  row: 'Click to show it in the conversation',
-  turn: 'Click to go to its turn',
-  none: '',
-}
+const leadHint = (lead: Lead, g: Group) =>
+  ({
+    file: 'Click to show the file',
+    page: 'Click to open the page in your browser',
+    show: 'Click to show it here',
+    jump: `Click to jump to turn ${firstTurn(g)} in the chat`,
+    none: '',
+  })[lead]
 
 /** Runs the first of `tries` that exits 0. */
 async function runFirst($: EngineInterface, tries: string[][]): Promise<boolean> {
@@ -403,31 +410,107 @@ async function runFirst($: EngineInterface, tries: string[][]): Promise<boolean>
   return false
 }
 
-const isWindows = async ($: EngineInterface) => (await $.env.get('OS')) === 'Windows_NT'
-
-/** Opens a file in the app's Files pane, else in VS Code, else as the system opens it. */
-async function openFile($: EngineInterface, path: string): Promise<boolean> {
-  const shown = await $.mcp.call('ccd_view', 'show_pane', { pane: 'file', path }).catch(() => undefined)
-  if (shown && !shown.isError) return true
-  if (await isWindows($)) {
-    const p = path.replace(/\//g, '\\')
-    return runFirst($, [
-      ['cmd', '/d', '/c', 'code', '-g', p],
-      ['rundll32', 'url.dll,FileProtocolHandler', p],
-    ])
-  }
-  return runFirst($, [['code', '-g', path], ['open', path], ['xdg-open', path]])
-}
-
 async function openPage($: EngineInterface, url: string): Promise<boolean> {
   if (!/^https?:\/\//i.test(url)) return false
-  return (await isWindows($)) ? runFirst($, [['rundll32', 'url.dll,FileProtocolHandler', url]]) : runFirst($, [['open', url], ['xdg-open', url]])
+  return (await $.env.get('OS')) === 'Windows_NT'
+    ? runFirst($, [['rundll32', 'url.dll,FileProtocolHandler', url]])
+    : runFirst($, [['open', url], ['xdg-open', url]])
 }
 
-/** Scrolls the conversation to a row: a tool call or a message, by its id. */
-async function reveal($: EngineInterface, requestId: string): Promise<boolean> {
-  const r = await $.ui.scroll({ to: { requestId }, block: 'center' }).catch(() => undefined)
-  return r !== undefined && !r.deny
+/**
+ * Shows a file in the app's Files pane. The app opens only files inside the
+ * session's folders there; for any other it answers an error.
+ */
+async function showInFilesPane($: EngineInterface, path: string): Promise<boolean> {
+  const shown = await $.mcp.call('ccd_view', 'show_pane', { pane: 'file', path }).catch(() => undefined)
+  return shown !== undefined && !shown.isError
+}
+
+const cutTo = (s: string, max: number): { text: string; note?: string } =>
+  s.length > max ? { text: s.slice(0, max), note: `first ${tok(max)} of ${tok(s.length)} characters` } : { text: s }
+
+/** A file's text, for the pane; undefined when it is gone or not text. */
+async function filePreview($: EngineInterface, path: string): Promise<Preview | undefined> {
+  if (!(await $.fs.exists(path).catch(() => false))) return undefined
+  const text = await readText($, path).catch(() => undefined)
+  if (text === undefined || text.includes('\u0000')) return undefined
+  const { text: source, note } = cutTo(text.replace(/\r\n/g, '\n'), PREVIEW_CHARS)
+  return { title: path, source, path, note }
+}
+
+/** A content value (a string or blocks) as text. */
+const textOf = (c: unknown): string =>
+  typeof c === 'string'
+    ? c
+    : Array.isArray(c)
+      ? c
+          .map((b: any) =>
+            typeof b === 'string' ? b : b?.type === 'text' ? String(b.text ?? '') : b?.type === 'image' ? '[image]' : b?.type === 'tool_result' ? textOf(b.content) : '',
+          )
+          .filter(Boolean)
+          .join('\n')
+      : ''
+
+/** The entry's first piece, found again in the transcript: a message's text, or a tool call with its result. */
+async function contentPreview($: EngineInterface, raw: UsageReport, g: Group): Promise<Preview | undefined> {
+  const rows = parseJsonl(await readText($, raw.file))
+  const title = g.label
+  const { messageId, toolUseId } = g.ref ?? {}
+  // a skill or a message: its text as the model read it
+  if (messageId && (!toolUseId || g.cat === 'skills')) {
+    const row = rows.find(r => r.uuid === messageId)
+    const text = textOf(row?.message?.content)
+    if (text) {
+      const { text: source, note } = cutTo(text, PREVIEW_CHARS)
+      return { title, source, note, isMarkdown: true }
+    }
+  }
+  if (!toolUseId) return undefined
+  let use: any
+  let result: unknown
+  for (const r of rows) {
+    for (const b of Array.isArray(r.message?.content) ? r.message.content : []) {
+      if ((b?.type === 'tool_use' || b?.type === 'server_tool_use') && b.id === toolUseId) use = b
+      else if (b?.type === 'tool_result' && b.tool_use_id === toolUseId) result = b.content
+    }
+  }
+  if (!use) return undefined
+  const input = use.input ?? {}
+  const command = typeof input.command === 'string' ? input.command : typeof input.cmd === 'string' ? input.cmd : undefined
+  const shell = /powershell/i.test(String(use.name)) ? 'powershell' : 'bash'
+  const output = textOf(result)
+  const joinNote = (...parts: (string | undefined)[]) => parts.filter(Boolean).join(' · ') || undefined
+  // a command or script: the command; its output: the output; else the call and its result
+  if (command !== undefined && g.cat !== 'termout') {
+    const { text: source, note } = cutTo(command, PREVIEW_CHARS)
+    return { title, source, language: shell, note: joinNote(input.description, note) }
+  }
+  if (g.cat === 'termout') {
+    const { text: source, note } = cutTo(output || '(no output)', PREVIEW_CHARS)
+    return { title, source, language: 'text', note: joinNote(command ? `$ ${command.split('\n')[0]}` : undefined, note) }
+  }
+  const call = JSON.stringify(input, null, 2)
+  const { text: source, note } = cutTo(`${use.name} ${call}${output ? `\n\n── result ──\n${output}` : ''}`, PREVIEW_CHARS)
+  return { title, source, language: 'text', note }
+}
+
+// the prompts' rows as the chat draws them: their text → the id a scroll takes
+const promptRows = new Map<string, string>()
+const promptKey = (s: string) => s.replace(/<[^>]+>/g, ' ').replace(/\s+/g, ' ').trim().slice(0, 60)
+
+/** Scrolls the chat to a turn's prompt; the reason when it cannot. */
+async function jumpToTurn($: EngineInterface, raw: UsageReport, turn: number): Promise<string | undefined> {
+  const row = raw.turnRows.find(t => t.turn === turn)
+  if (!row) return `turn ${turn} is not in the report`
+  const ids = [promptRows.get(promptKey(row.prompt)), row.promptId].filter((id): id is string => Boolean(id))
+  if (ids.length === 0) return 'its prompt has not been drawn in the chat'
+  let reason = ''
+  for (const requestId of ids) {
+    const r = await $.ui.scroll({ to: { requestId }, block: 'start' }).catch((err: unknown) => ({ deny: (err as Error)?.message ?? String(err) }))
+    if (!r.deny) return undefined
+    reason = r.deny
+  }
+  return reason
 }
 
 const activeMsOf = (r: UsageReport) => r.time.filter(t => t.id !== 'idle').reduce((s, t) => s + t.ms, 0)
@@ -482,6 +565,13 @@ export const register: Register = on => {
   on('ui.press', async ($, e, next) => {
     const isOwn = e.plugin === PLUGIN && (e.element === 'usage-toggle' || e.element === 'usage-details')
     if (!isOwn) void closePopover($)
+    return next(e)
+  })
+
+  // learn each prompt's row id as the chat draws it, for a jump to its turn;
+  // the drawing itself is the engine's, untouched
+  on('ui.render', { component: 'UserMessage' }, async ($, e, next) => {
+    if (!e.props.from && !e.props.task) promptRows.set(promptKey(e.props.text), e.requestId)
     return next(e)
   })
 
@@ -575,6 +665,7 @@ export const register: Register = on => {
     const { value: note = '' } = await $.state.get(STATUS)
     const { value: filter = NO_FILTER } = await $.state.get(FILTER)
     const { value: measure } = await $.state.get(MEASURE)
+    const { value: preview = null } = await $.state.get(PREVIEW)
     const cols = Math.max(50, Math.min(160, e.props.bodyColumns ?? e.viewport?.columns ?? 100))
     const setTab = (id: string) => () => void $.state.set(TAB, id)
     const setFilter = (next: Filter) => void $.state.set(FILTER, next)
@@ -603,20 +694,32 @@ export const register: Register = on => {
     const refreshNow = () => void refreshPane($, raw.sessionId)
     const isLive = raw.sessionId === (await $.session.id())
 
-    // a details entry's click: its file, its page, its row in the
-    // conversation, else its turn; each step falls through when it cannot
+    // a details entry's click: a file in the Files pane (else here), a page in
+    // the browser, a command, output or skill here, anything else its turn in
+    // the chat; nothing filters, and a step that cannot says why
+    const show = async (p: Preview | undefined, what: string) => {
+      if (!p) return $.ui.toast(`Could not find ${what}.`)
+      await $.state.set(PREVIEW, p)
+      void $.ui.scroll({ in: PANE, to: { key: 'preview-close' }, block: 'start' }).catch(() => undefined)
+    }
     const goTo = async (g: Group) => {
-      const turn = firstTurn(g)
       const lead = leadOf(g, isLive)
-      if (lead === 'file' && g.ref?.path && (await openFile($, g.ref.path))) return
-      if (g.ref?.url && (await openPage($, g.ref.url))) return
-      if (isLive) {
-        const prompt = raw.turnRows.find(t => t.turn === turn)?.promptId
-        for (const id of [g.ref?.toolUseId, g.ref?.messageId, prompt]) if (id && (await reveal($, id))) return
+      const turn = firstTurn(g)
+      if (lead === 'file' && g.ref?.path) {
+        if (await showInFilesPane($, g.ref.path)) return
+        // outside the session's folders the Files pane opens nothing: show it here
+        return show((await filePreview($, g.ref.path)) ?? (await contentPreview($, raw, g).catch(() => undefined)), g.ref.path)
       }
-      if (turn !== undefined) {
-        setFilter({ ...filter, turns: [turn] })
-        $.ui.toast(lead === 'file' ? `Could not open ${g.ref?.path}; filtered to turn ${turn} instead.` : `Filtered to turn ${turn}, where it first came in.`)
+      if (lead === 'page' && g.ref?.url) {
+        if (!(await openPage($, g.ref.url))) $.ui.toast(`Could not open ${g.ref.url}`)
+        return
+      }
+      if (lead === 'show') return show(await contentPreview($, raw, g).catch(() => undefined), g.label)
+      if (lead === 'jump' && turn !== undefined) {
+        const why = await jumpToTurn($, raw, turn)
+        if (why === undefined) return
+        if (g.ref?.messageId) return show(await contentPreview($, raw, g).catch(() => undefined), g.label)
+        $.ui.toast(`Could not jump to turn ${turn}: ${why}`)
       }
     }
 
@@ -819,7 +922,7 @@ export const register: Register = on => {
                               g.label,
                               `${money(g.cost)} · ${tok(g.tokens)} tokens added${g.count > 1 ? ` · ${g.count} pieces` : ''}`,
                               ...(where && where !== g.label ? [where] : []),
-                              ...(lead === 'none' ? [] : [lead === 'turn' ? `${LEAD_HINT.turn} (${firstTurn(g)})` : LEAD_HINT[lead]]),
+                              ...(lead === 'none' ? [] : [leadHint(lead, g)]),
                             ].join('\n'),
                             onPress: lead === 'none' ? undefined : () => void goTo(g),
                           }
@@ -946,11 +1049,33 @@ export const register: Register = on => {
           </Box>
         )
 
+      // what a details entry's click put on show: the file, script, output or skill itself
+      const { Code, Markdown } = els
+      const shown = preview ? (
+        <Box flexDirection="column" marginTop={2} borderStyle="round" borderDimColor paddingX={1}>
+          <Box flexDirection="row" justifyContent="space-between" alignItems="center" gap={1}>
+            <Text bold wrap="truncate-middle">
+              {preview.title}
+            </Text>
+            <Button key="preview-close" label="✕" dimColor onPress={() => void $.state.set(PREVIEW, null)} />
+          </Box>
+          {preview.note ? <Text dimColor>{preview.note}</Text> : null}
+          <Box marginTop={1}>
+            {preview.isMarkdown ? (
+              <Markdown text={preview.source} />
+            ) : (
+              <Code source={preview.source} language={preview.language} path={preview.path} startLine={preview.path ? 1 : undefined} />
+            )}
+          </Box>
+        </Box>
+      ) : null
+
       return (
         <Box flexDirection="column">
           {tabBar}
           {filterBar}
           {note ? <Text dimColor>{note}</Text> : null}
+          {shown}
           <Box flexDirection="column">{body}</Box>
         </Box>
       )

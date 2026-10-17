@@ -158,7 +158,7 @@ describe('cost', () => {
     expect(b.ttl.w1h).toBe(80100)
   })
 
-  test('every chart draws, with a card for every hover target', () => {
+  test('every chart draws, every hover a system tooltip and the same (i)', () => {
     const all = [
       overviewTop(r),
       timeChart(r),
@@ -176,13 +176,19 @@ describe('cost', () => {
     ]
     for (const source of all) {
       expect(source.startsWith('<svg')).toBe(true)
-      const targets = source.match(/class="[^"]*\bh\d+"/g)?.length ?? 0
-      const cards = source.match(/class="tip t\d+"/g)?.length ?? 0
-      expect(cards).toBe(targets)
+      // every hover target carries its tooltip; no card drawn inside, no font glyph for the (i)
+      const targets = source.match(/class="hit h\d+"/g)?.length ?? 0
+      const titled = source.match(/class="hit h\d+"><title>/g)?.length ?? 0
+      expect(titled).toBe(targets)
+      expect(source.includes('class="tip')).toBe(false)
+      expect(source.includes('ⓘ')).toBe(false)
+      // a picture: the arrow cursor, nothing to select
+      expect(source.includes('cursor:default')).toBe(true)
     }
-    // one column per request, and the (i) inside the title's own text
+    // one column per request, and the chart's (i) is the same icon as a heading's
     expect(contextChart(r).match(/class="hit h\d+"/g)?.length).toBe(4)
-    expect(/class="t f16 b icon h0">Context sent per request<tspan[^>]*>ⓘ<\/tspan><\/text>/.test(contextChart(r))).toBe(true)
+    const icon = (s: string) => s.match(/<circle[^>]*class="ic"[^>]*\/>/)?.[0]?.replace(/c[xy]="[\d.]+"/g, '')
+    expect(icon(contextChart(r))).toBe(icon(infoIcon('x')))
   })
 
   test('the small pictures carry their tooltip as a title', () => {
