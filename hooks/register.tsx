@@ -26,6 +26,7 @@ import { NO_FILTER, applyFilter, detailsOf, viewOf } from './filter'
 import { bar, cachingStory, cut, dur, mdAgentTable, mdCostTable, money, pct, tok, toMarkdown } from './format'
 import { type CachedFile, type CostPoint, WINDOW_MS, pack, requestCosts, scanLine, unpack, windowShare } from './limits'
 
+const PLUGIN = 'session-insights'
 const PANE = 'session-insights'
 // a pane an earlier version opened from the footer; closed when the mod loads
 const SUMMARY = 'session-insights-summary'
@@ -479,7 +480,7 @@ export const register: Register = on => {
     return next(e)
   })
   on('ui.press', async ($, e, next) => {
-    const isOwn = e.plugin === REPORT.plugin &&(e.element === 'usage-toggle' || e.element === 'usage-details')
+    const isOwn = e.plugin === PLUGIN && (e.element === 'usage-toggle' || e.element === 'usage-details')
     if (!isOwn) void closePopover($)
     return next(e)
   })
