@@ -88,6 +88,8 @@ export type TurnRow = {
   cost: number
   cacheRead: number
   cacheWrite: number
+  /** The transcript row of the turn's prompt, to scroll to. */
+  promptId?: string
 }
 
 /** One turn's cost and tokens for one kind of content, subagents included. */
@@ -104,6 +106,13 @@ export type TurnCat = {
 /** One tool's calls within one turn. */
 export type ToolTurn = { turn: number; tool: string; calls: number; ms: number; resultTokens: number }
 
+/**
+ * Where an entry of the details leads: its file, its web page, or its row in
+ * the transcript (a tool call's id, a message's uuid). Subagents' rows are not
+ * in the main transcript: their entries carry no ids.
+ */
+export type Ref = { path?: string; url?: string; toolUseId?: string; messageId?: string }
+
 /** One entry of a kind of content's details: a file, a skill, a command, all its pieces summed. */
 export type Group = {
   cat: string
@@ -114,6 +123,8 @@ export type Group = {
   count: number
   /** Its cost by turn. */
   byTurn: Record<string, number>
+  /** Where it leads, from its first piece that says. */
+  ref?: Ref
 }
 
 export type TopItem = {

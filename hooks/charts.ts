@@ -877,11 +877,13 @@ export function ring(percent: number, title: string, size = 16): string {
 }
 
 /**
- * The short summary the footer's indicator opens: cost, this session's part
- * of each limit, the context and the time, one bar each.
+ * The short summary the footer's button opens, laid out as the app's own
+ * context card is: a heading line, the cost, then one compact row per limit
+ * and the context (name left; detail and figure right; a thin bar under it).
+ * Each row's native tooltip says what its figure means.
  */
-export function summaryCard(r: UsageReport, measure?: Measure): string {
-  const c = new Canvas()
+export function summaryCard(r: UsageReport, measure?: Measure, width = 380): string {
+  const w = Math.round(width)
   const five = r.live?.limits.find(l => l.kind === 'five_hour')
   const week = r.live?.limits.find(l => l.kind === 'seven_day')
   const ctx = r.live ? (r.live.contextPercent ?? (100 * (r.live.contextTokens ?? r.contextNow)) / Math.max(1, r.live.contextWindow)) : undefined
@@ -891,39 +893,63 @@ export function summaryCard(r: UsageReport, measure?: Measure): string {
     const at = iso ? Date.parse(iso) : NaN
     return Number.isFinite(at) ? `resets in ${dur(Math.max(0, at - r.generatedAt)).replace(/ 00[ms]$/, '')}` : ''
   }
-  type Line = { label: string; value: string; sub: string; used?: number; mine?: number }
-  const limitLine = (label: string, l?: LimitWindow): Line | undefined =>
-    l && {
-      label: `${label} · this session`,
-      value: l.session === undefined ? '…' : `≈ ${l.session < 10 ? l.session.toFixed(1) : Math.round(l.session)}%`,
-      sub: `${Math.round(l.percentUsed)}% used in all · ${l.session === undefined ? pending : resets(l.resetsAt)}`,
-      used: l.percentUsed,
-      mine: l.session,
-    }
-  const lines = [
-    { label: 'Cost (API prices)', value: money(r.cost.total), sub: `${money(r.cost.noCache)} without caching · ${tok(r.input.cacheRead + r.input.cacheWrite + r.input.uncached)} input tokens` },
-    limitLine('5-hour limit', five),
-    limitLine('Weekly limit', week),
-    ctx === undefined ? undefined : { label: 'Context', value: `${Math.round(ctx)}%`, sub: `${tok(r.live?.contextTokens ?? r.contextNow)} of ${tok(r.live?.contextWindow ?? 0)}`, used: ctx },
-    { label: 'Active time', value: dur(active), sub: `${r.turns} turns · ${r.requests} requests` },
-  ].filter((l): l is Line => l !== undefined)
-  const rowH = 58
-  lines.forEach((l, k) => {
-    const y = k * rowH
-    c.add(text(0, y + 18, l.label, 't2'))
-    c.add(text(W, y + 18, l.value, 't b e'))
-    if (l.used !== undefined) {
-      const used = Math.max(0, Math.min(100, l.used)) / 100
-      const mine = Math.max(0, Math.min(used, (l.mine ?? 0) / 100))
-      c.add(rect(0, y + 27, W, 6, 'track', 'all'))
-      if (l.mine !== undefined) {
-        c.add(rect(0, y + 27, W * (used - mine), 6, l.used >= 90 ? 'crit' : 'other'))
-        c.add(rect(W * (used - mine), y + 27, Math.max(2, W * mine), 6, 'read'))
-      } else c.add(rect(0, y + 27, Math.max(2, W * used), 6, l.used >= 90 ? 'crit' : 'read'))
-    }
-    c.add(text(0, y + (l.used !== undefined ? 50 : 38), l.sub, 't3 f13'))
-  })
-  return c.finish(lines.length * rowH)
+  // right-aligned: a dim detail, then the figure in bold
+  const right = (y: number, detail: string, value: string, tail = '') =>
+    `<text x="${w}" y="${y}" class="e f13"><tspan class="t3">${esc(detail)}</tspan><tspan class="t b">${esc(value)}</tspan>${tail ? `<tspan class="t3">${esc(tail)}</tspan>` : ''}</text>`
+  const row = (y: number, h: number, title: string, body: string) =>
+    `<g><title>${esc(title)}</title><rect x="0" y="${y}" width="${w}" height="${h}" fill="transparent"/>${body}</g>`
+  const bar = (y: number, used: number, mine?: number) => {
+    const u = Math.max(0, Math.min(100, used)) / 100
+    const m = Math.max(0, Math.min(u, (mine ?? 0) / 100))
+    const hot = used >= 90 ? 'crit' : 'other'
+    return (
+      rect(0, y, w, 4, 'track', 'all') +
+      (mine === undefined
+        ? rect(0, y, Math.max(2, w * u), 4, used >= 90 ? 'crit' : 'read', 'all')
+        : rect(0, y, w * (u - m), 4, hot) + rect(w * (u - m), y, Math.max(2, w * m), 4, 'read', 'right'))
+    )
+  }
+
+  let y = 0
+  let body = ''
+  // heading: what the card is about, and how long the session has run
+  body += `<text x="0" y="${y + 14}" class="t b">Session usage</text>`
+  body += `<text x="${w}" y="${y + 14}" class="t3 f12 e">${esc(`${dur(active)} active · ${r.turns} turns`)}</text>`
+  y += 26
+  body += row(
+    y,
+    22,
+    `${money(r.cost.total)} at API prices; ${money(r.cost.noCache)} if nothing had been cached.\n${tok(r.input.cacheRead + r.input.cacheWrite + r.input.uncached)} input tokens · ${tok(r.output.total)} output tokens · ${r.requests} requests`,
+    text(0, y + 14, 'Cost at API prices', 't2 f13') + right(y + 14, `${money(r.cost.noCache)} uncached · `, money(r.cost.total)),
+  )
+  y += 26
+  body += `<line x1="0" x2="${w}" y1="${y + 0.5}" y2="${y + 0.5}" class="grid"/>`
+  y += 10
+  const limitRow = (name: string, l?: LimitWindow) => {
+    if (!l) return
+    const share = l.session === undefined ? '…' : `≈ ${l.session < 10 ? l.session.toFixed(1) : Math.round(l.session)}%`
+    const detail = l.session === undefined ? `${pending} · ` : `${resets(l.resetsAt)} · `
+    body += row(
+      y,
+      30,
+      `${name}: this session used ${share} of it; ${Math.round(l.percentUsed)}% is used in all, by every session and app on the account.${l.sessions ? `\n${l.sessions} local sessions used this window.` : ''}`,
+      text(0, y + 14, name, 't2 f13') + right(y + 14, detail, share, ` of ${Math.round(l.percentUsed)}%`) + bar(y + 22, l.percentUsed, l.session),
+    )
+    y += 34
+  }
+  limitRow('5-hour limit', five)
+  limitRow('Weekly limit', week)
+  if (ctx !== undefined) {
+    body += row(
+      y,
+      30,
+      `The context the next request sends: ${tok(r.live?.contextTokens ?? r.contextNow)} of the model's ${tok(r.live?.contextWindow ?? 0)}.`,
+      text(0, y + 14, 'Context', 't2 f13') + right(y + 14, `${tok(r.live?.contextTokens ?? r.contextNow)} of ${tok(r.live?.contextWindow ?? 0)} · `, `${Math.round(ctx)}%`) + bar(y + 22, ctx),
+    )
+    y += 34
+  }
+  const h = y - 4
+  return `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 ${w} ${h}" width="${w}" height="${h}" font-family="system-ui, -apple-system, Segoe UI, sans-serif">${STYLE}${body}</svg>`
 }
 
 // ---------- the footer's tooltip and popover ----------

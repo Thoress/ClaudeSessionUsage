@@ -18,6 +18,7 @@ import type {
   AgentRow,
   CacheBreak,
   Price,
+  Ref,
   RequestPoint,
   CatRow,
   Group,
@@ -137,10 +138,12 @@ function host(u: unknown): string {
   return m?.[1] ?? firstLine(u, 40)
 }
 
-/** The skill's folder name, from "Base directory for this skill: <path>". */
+/** The skill's folder, from "Base directory for this skill: <path>". */
+const skillDir = (text: string) => /Base directory for this skill:\s*(\S+)/.exec(text)?.[1] ?? ''
+
+/** The skill's folder name. */
 function skillName(text: string): string {
-  const path = /Base directory for this skill:\s*(\S+)/.exec(text)?.[1] ?? ''
-  return path.split(/[\\/]/).filter(Boolean).pop() ?? 'skill'
+  return skillDir(text).split(/[\\/]/).filter(Boolean).pop() ?? 'skill'
 }
 
 const isCodePath =(p: unknown) => CODE_EXT.test(String(p ?? ''))
@@ -173,7 +176,13 @@ type ToolInfo = {
   label: string
   bucket: string
   startedAt: number
+  /** The file or page it worked on. */
+  path?: string
+  url?: string
 }
+
+const str = (v: unknown) => (typeof v === 'string' && v ? v : undefined)
+const webUrl = (v: unknown) => (typeof v === 'string' && /^https?:\/\//i.test(v) ? v : undefined)
 
 function classifyTool(name: string, input: Row): Omit<ToolInfo, 'startedAt'> {
   const i = input ?? {}
@@ -190,12 +199,12 @@ function classifyTool(name: string, input: Row): Omit<ToolInfo, 'startedAt'> {
   if (name === 'Read' || name === 'NotebookRead') {
     const p = i.file_path ?? i.notebook_path
     const cat = isCodePath(p) ? 'code_read' : 'doc_read'
-    return { name, inCat: cat, outCat: cat, label: `Read ${baseName(p)}`, bucket: 't_files' }
+    return { name, inCat: cat, outCat: cat, label: `Read ${baseName(p)}`, bucket: 't_files', path: str(p) }
   }
   if (name === 'Write' || name === 'Edit' || name === 'MultiEdit' || name === 'NotebookEdit') {
     const p = i.file_path ?? i.notebook_path
     const cat = isCodePath(p) ? 'code_write' : 'doc_write'
-    return { name, inCat: cat, outCat: cat, label: `${name} ${baseName(p)}`, bucket: 't_files' }
+    return { name, inCat: cat, outCat: cat, label: `${name} ${baseName(p)}`, bucket: 't_files', path: str(p) }
   }
   if (name === 'Grep' || name === 'Glob' || name === 'LS') {
     return { name, inCat: 'search', outCat: 'search', label: `${name} ${firstLine(i.pattern ?? i.path, 50)}`, bucket: 't_search' }
@@ -203,7 +212,7 @@ function classifyTool(name: string, input: Row): Omit<ToolInfo, 'startedAt'> {
   if (isWeb(name)) {
     const what = i.url ?? i.query ?? i.text ?? i.action ?? ''
     const short = name.replace(/^mcp__[^_]+(__[^_]+)?__/, '')
-    return { name, inCat: 'web', outCat: 'web', label: `${short} ${i.url ? host(i.url) : firstLine(what, 50)}`, bucket: 't_web' }
+    return { name, inCat: 'web', outCat: 'web', label: `${short} ${i.url ? host(i.url) : firstLine(what, 50)}`, bucket: 't_web', url: webUrl(i.url) }
   }
   if (name === 'Agent' || name === 'Task') {
     return { name, inCat: 'agents', outCat: 'agents', label: `Agent: ${firstLine(i.description ?? i.prompt, 55)}`, bucket: 't_agents' }
@@ -247,6 +256,7 @@ type Item = {
   /** What generating it cost, where the model wrote it (a reply, a tool call's input). */
   outCost: number
   resultOf?: string
+  ref?: Ref
 }
 
 type Interval = { from: number; to: number; kind: 'model' | 'tool'; bucket: string; tool?: string }
@@ -264,6 +274,7 @@ type Turn = {
   cost: number
   cacheRead: number
   cacheWrite: number
+  promptId?: string
 }
 
 export type ChainResult = {
@@ -346,6 +357,8 @@ export function analyzeChain(rows: Row[], turnOf?: (at: number) => number): Chai
   }
 
   const turnNow = (at: number) => (turnOf ? turnOf(at) : res.turns.length)
+  // a subagent's rows are not in the main transcript: nothing to scroll to
+  const rowId = (id: unknown) => (turnOf ? undefined : str(id))
   const turnCat = (turn: number, cat: string): TurnCat => {
     const key = `${turn}|${cat}`
     let tc = res.turnCats.get(key)
@@ -360,7 +373,7 @@ export function analyzeChain(rows: Row[], turnOf?: (at: number) => number): Chai
     return (p.cats[cat] ??= [0, 0, 0])
   }
 
-  const toolUses = new Map<string, ToolInfo>()
+  const toolUses = new Map<string, ToolInfo & { ref: Ref }>()
   let pending: Item[] = []
   let live: Item[] = []
   let sysItem: Item | undefined
@@ -389,9 +402,10 @@ export function analyzeChain(rows: Row[], turnOf?: (at: number) => number): Chai
   // a turn of its own (a background task or another agent woke the session)
   let turnEnded = false
   let wakeLabel = ''
-  const startTurn = (label: string, at: number) => {
+  const startTurn = (label: string, at: number, promptId?: string) => {
     turn = {
       prompt: label,
+      promptId,
       startedAt: at,
       lastAt: at,
       requests: 0,
@@ -407,8 +421,8 @@ export function analyzeChain(rows: Row[], turnOf?: (at: number) => number): Chai
     turnEnded = false
   }
 
-  const newItem = (cat: string, w: number, label: string, resultOf?: string): Item => {
-    const it: Item = { cat, w, label, tokens: 0, reads: 0, processed: 0, cost: 0, byTurn: {}, outCost: 0, resultOf }
+  const newItem = (cat: string, w: number, label: string, resultOf?: string, ref?: Ref): Item => {
+    const it: Item = { cat, w, label, tokens: 0, reads: 0, processed: 0, cost: 0, byTurn: {}, outCost: 0, resultOf, ref }
     res.items.push(it)
     return it
   }
@@ -680,14 +694,15 @@ export function analyzeChain(rows: Row[], turnOf?: (at: number) => number): Chai
           if (w > 0) pending.push(newItem('thinking', w, 'Thinking'))
         } else if (b.type === 'text') {
           const w = textLen(b.text)
-          const item = newItem('reply', w, `Reply: ${firstLine(b.text, 55)}`)
+          const item = newItem('reply', w, `Reply: ${firstLine(b.text, 55)}`, undefined, { messageId: rowId(r.uuid) })
           cur?.blocks.push({ cat: 'reply', w, item })
           pending.push(item)
         } else if (b.type === 'tool_use' || b.type === 'server_tool_use') {
-          const info = { ...classifyTool(String(b.name), b.input), startedAt: at }
+          const tool = classifyTool(String(b.name), b.input)
+          const info = { ...tool, startedAt: at, ref: { path: tool.path, url: tool.url, toolUseId: rowId(b.id) } }
           toolUses.set(b.id, info)
           const w = JSON.stringify(b.input ?? {}).length + String(b.name).length
-          const item = newItem(info.inCat, w, info.label)
+          const item = newItem(info.inCat, w, info.label, undefined, info.ref)
           cur?.blocks.push({ cat: info.inCat, w, item })
           pending.push(item)
           if (info.name === 'Agent' || info.name === 'Task') res.agentLabels.set(b.id, info.label)
@@ -709,7 +724,7 @@ export function analyzeChain(rows: Row[], turnOf?: (at: number) => number): Chai
           const info = toolUses.get(b.tool_use_id)
           const w = weight(b.content)
           const cat = info?.outCat ?? 'other_tools'
-          pending.push(newItem(cat, w, info ? `${info.label} → result` : 'Tool result', info?.name))
+          pending.push(newItem(cat, w, info ? `${info.label} → result` : 'Tool result', info?.name, info?.ref ?? { toolUseId: rowId(b.tool_use_id) }))
           if (info && Number.isFinite(info.startedAt) && Number.isFinite(at)) {
             const ms = Math.max(0, at - info.startedAt)
             const src = String(r.permissionDecision?.source ?? '')
@@ -744,14 +759,15 @@ export function analyzeChain(rows: Row[], turnOf?: (at: number) => number): Chai
       } else if (r.isMeta) {
         const isSkill = /^Base directory for this skill/.test(text)
         if (turnEnded) wakeLabel = `(woken) ${firstLine(text.replace(/<[^>]+>/g, ' '), 70)}`
-        pending.push(newItem(isSkill ? 'skills' : 'reminders', w, isSkill ? `Skill: ${skillName(text)}` :`Meta: ${firstLine(text, 50)}`))
+        const ref = { messageId: rowId(r.uuid), path: isSkill && skillDir(text) ? `${skillDir(text)}/SKILL.md` : undefined }
+        pending.push(newItem(isSkill ? 'skills' : 'reminders', w, isSkill ? `Skill: ${skillName(text)}` : `Meta: ${firstLine(text, 50)}`, undefined, ref))
       } else {
         closeRequest()
         const isNotification = /^<task-notification>/.test(text.trim())
         const label = isNotification ? 'Background task notification' : firstLine(text.replace(/<[^>]+>/g, ' '), 80)
-        pending.push(newItem(isNotification ? 'reminders' : 'prompt', w, `Prompt: ${label}`))
+        pending.push(newItem(isNotification ? 'reminders' : 'prompt', w, `Prompt: ${label}`, undefined, { messageId: rowId(r.uuid) }))
         if (!res.firstPrompt) res.firstPrompt = label
-        if (!isNotification || !turn || turnEnded) startTurn(isNotification ? `(woken) ${label}` : label, at)
+        if (!isNotification || !turn || turnEnded) startTurn(isNotification ? `(woken) ${label}` : label, at, rowId(r.uuid))
         wakeLabel = ''
       }
       if (Number.isFinite(at)) lastInputAt = at
@@ -874,6 +890,7 @@ export function buildReport(
       cost: t.cost,
       cacheRead: t.cacheRead,
       cacheWrite: t.cacheWrite,
+      promptId: t.promptId,
     })
   })
   const timeRows: TimeRow[] = Object.entries(BUCKETS)
@@ -1023,6 +1040,14 @@ function groupLabel(it: Item): string {
   return l
 }
 
+/** `a`'s fields, those it lacks from `b`; undefined when neither says anything. */
+function mergeRef(a: Ref | undefined, b: Ref): Ref | undefined {
+  const out: Ref = { ...a }
+  for (const k of ['path', 'url', 'toolUseId', 'messageId'] as const) out[k] ??= b[k]
+  for (const k of Object.keys(out) as (keyof Ref)[]) if (out[k] === undefined) delete out[k]
+  return Object.keys(out).length > 0 ? out : undefined
+}
+
 /** Items summed by kind and name, the most expensive 40 of each kind kept. */
 function groupItems(items: Item[], turnCats: TurnCat[]): Group[] {
   const byKey = new Map<string, Group>()
@@ -1034,6 +1059,7 @@ function groupItems(items: Item[], turnCats: TurnCat[]): Group[] {
     g.tokens += it.tokens
     g.count++
     for (const [turn, c] of Object.entries(it.byTurn)) g.byTurn[turn] = (g.byTurn[turn] ?? 0) + c
+    if (it.ref) g.ref = mergeRef(g.ref, it.ref)
     byKey.set(key, g)
   }
   // thinking leaves no item behind (its text is not kept): one entry per turn

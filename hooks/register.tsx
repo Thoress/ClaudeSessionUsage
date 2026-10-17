@@ -1,6 +1,6 @@
 import type { EngineInterface, Register } from 'claude-code'
 
-import type { Filter, LimitWindow, LiveUsage, Measure, UsageReport } from '../types'
+import type { Filter, Group, LimitWindow, LiveUsage, Measure, UsageReport } from '../types'
 import { BUCKETS, CATS, buildReport, parseJsonl } from './analyze'
 import {
   TURN_INFO,
@@ -48,11 +48,11 @@ const PX_PER_COLUMN = 7.6
 
 const TABS: [string, string][] = [
   ['overview', 'Overview'],
-  ['timeline', 'Over time'],
-  ['content', 'By content'],
+  ['timeline', 'Timeline'],
+  ['content', 'Content'],
   ['time', 'Time'],
-  ['top', 'Biggest items'],
-  ['agents', 'Subagents'],
+  ['top', 'Top items'],
+  ['agents', 'Agents'],
 ]
 // tab ids an earlier version stored
 const OLD_TABS: Record<string, string> = { tokens: 'content', turns: 'timeline' }
@@ -346,6 +346,89 @@ async function refreshPane($: EngineInterface, sessionId: string): Promise<Usage
   }
 }
 
+// a footer drawn before any report (a session the mod joined midway) asks
+// for one; at most every few seconds, so a session with no transcript yet
+// does not ask on every draw
+let warmedAt = -Infinity
+function warmUp($: EngineInterface) {
+  $.clock.after(0, async () => {
+    const now = await $.clock.now()
+    if (now - warmedAt < 5000) return
+    warmedAt = now
+    await refreshCurrent($)
+  })
+}
+
+async function closePopover($: EngineInterface) {
+  const { value: isOpen = false } = await $.state.get(POPOVER)
+  if (isOpen) await $.state.set(POPOVER, false)
+}
+
+// ---------- leading from a details entry to what it was ----------
+
+const FILE_CATS = /^(code|doc)_(read|write)$|^skills$/
+
+/** The first turn an entry cost anything in. */
+const firstTurn = (g: Group) =>
+  Object.entries(g.byTurn)
+    .filter(([, c]) => c > 0)
+    .map(([t]) => Number(t))
+    .sort((a, b) => a - b)[0]
+
+type Lead = 'file' | 'page' | 'row' | 'turn' | 'none'
+
+/** Where a click on the entry leads; `isLive` when the pane shows the running session. */
+function leadOf(g: Group, isLive: boolean): Lead {
+  if (g.ref?.path && FILE_CATS.test(g.cat)) return 'file'
+  if (g.ref?.url) return 'page'
+  if (isLive && (g.ref?.toolUseId || g.ref?.messageId)) return 'row'
+  return firstTurn(g) === undefined ? 'none' : 'turn'
+}
+
+const LEAD_HINT: Record<Lead, string> = {
+  file: 'Click to open the file',
+  page: 'Click to open the page',
+  row: 'Click to show it in the conversation',
+  turn: 'Click to go to its turn',
+  none: '',
+}
+
+/** Runs the first of `tries` that exits 0. */
+async function runFirst($: EngineInterface, tries: string[][]): Promise<boolean> {
+  for (const argv of tries) {
+    const r = await $.process.run(argv, { timeoutMs: 15_000 }).catch(() => undefined)
+    if (r?.exitCode === 0) return true
+  }
+  return false
+}
+
+const isWindows = async ($: EngineInterface) => (await $.env.get('OS')) === 'Windows_NT'
+
+/** Opens a file in the app's Files pane, else in VS Code, else as the system opens it. */
+async function openFile($: EngineInterface, path: string): Promise<boolean> {
+  const shown = await $.mcp.call('ccd_view', 'show_pane', { pane: 'file', path }).catch(() => undefined)
+  if (shown && !shown.isError) return true
+  if (await isWindows($)) {
+    const p = path.replace(/\//g, '\\')
+    return runFirst($, [
+      ['cmd', '/d', '/c', 'code', '-g', p],
+      ['rundll32', 'url.dll,FileProtocolHandler', p],
+    ])
+  }
+  return runFirst($, [['code', '-g', path], ['open', path], ['xdg-open', path]])
+}
+
+async function openPage($: EngineInterface, url: string): Promise<boolean> {
+  if (!/^https?:\/\//i.test(url)) return false
+  return (await isWindows($)) ? runFirst($, [['rundll32', 'url.dll,FileProtocolHandler', url]]) : runFirst($, [['open', url], ['xdg-open', url]])
+}
+
+/** Scrolls the conversation to a row: a tool call or a message, by its id. */
+async function reveal($: EngineInterface, requestId: string): Promise<boolean> {
+  const r = await $.ui.scroll({ to: { requestId }, block: 'center' }).catch(() => undefined)
+  return r !== undefined && !r.deny
+}
+
 const activeMsOf = (r: UsageReport) => r.time.filter(t => t.id !== 'idle').reduce((s, t) => s + t.ms, 0)
 
 /** One line per figure, for the footer's hover. */
@@ -380,7 +463,24 @@ export const register: Register = on => {
     for (const key of await $.store.keys()) if (key.startsWith('limits:')) await $.store.delete(key)
     void $.ui.close({ id: SUMMARY })
     // a resumed session has turns already: show them in the footer
-    $.clock.after(2000, () => void refreshCurrent($))
+    $.clock.after(300, () => void refreshCurrent($))
+    return next(e)
+  })
+
+  // the popover closes as a popover does: when the person turns to something
+  // else (types, sends, presses anything but the popover's own buttons). The
+  // app tells a plugin of no click elsewhere, so these stand in for one.
+  on('prompt.edit', async ($, e, next) => {
+    void closePopover($)
+    return next(e)
+  })
+  on('prompt.submit', async ($, e, next) => {
+    void closePopover($)
+    return next(e)
+  })
+  on('ui.press', async ($, e, next) => {
+    const isOwn = e.plugin === REPORT.plugin &&(e.element === 'usage-toggle' || e.element === 'usage-details')
+    if (!isOwn) void closePopover($)
     return next(e)
   })
 
@@ -418,7 +518,12 @@ export const register: Register = on => {
   on('ui.render', { component: 'SessionMode' }, async ($, e, next) => {
     if (e.surface === 'terminal') return next(e)
     const { value: r } = await $.state.get(CURRENT)
-    if (!r) return next(e)
+    // no report yet, or one of the session before a /clear: ask for one now
+    // rather than at the end of the next turn
+    if (!r || r.sessionId !== (await $.session.id())) {
+      warmUp($)
+      if (!r) return next(e)
+    }
     const { value: isOpen = false } = await $.state.get(POPOVER)
     const { Box, Text, Button } = $.ui.resolve(e)
     const five = r.live?.limits.find(l => l.kind === 'five_hour')
@@ -442,8 +547,8 @@ export const register: Register = on => {
     if (!isOpen || !r) return next(e)
     const { value: measure } = await $.state.get(MEASURE)
     const { Box, Button, Svg } = $.ui.resolve(e)
-    setChartWidth(Math.min(560, Math.max(320, e.props.bodyColumns * PX_PER_COLUMN - 24)))
-    const card = summaryCard(r, measure)
+    // as wide as the app's own context card, narrower only in a narrow window
+    const card = summaryCard(r, measure, Math.min(380, Math.max(260, e.props.bodyColumns * PX_PER_COLUMN - 24)))
     const { width, height } = svgSize(card)
     const openDetails = async () => {
       await $.state.set(POPOVER, false)
@@ -453,13 +558,10 @@ export const register: Register = on => {
     }
     return (
       <Box flexDirection="column" gap={1}>
-        <Svg source={card} alt={summaryText(r)} width={width} height={height} />
-        <Box flexDirection="row" gap={1}>
-          <Button key="usage-details" variant="primary" onPress={() => void openDetails()}>
-            Show details
-          </Button>
-          <Button key="usage-close" onPress={() => void $.state.set(POPOVER, false)}>
-            Close
+        <Svg source={card} alt={summaryText(r)} width={width} height={height} isInteractive />
+        <Box flexDirection="row">
+          <Button key="usage-details" onPress={() => void openDetails()}>
+            Show the full breakdown
           </Button>
         </Box>
       </Box>
@@ -498,6 +600,24 @@ export const register: Register = on => {
       $.ui.toast(`Written to ${path}`)
     }
     const refreshNow = () => void refreshPane($, raw.sessionId)
+    const isLive = raw.sessionId === (await $.session.id())
+
+    // a details entry's click: its file, its page, its row in the
+    // conversation, else its turn; each step falls through when it cannot
+    const goTo = async (g: Group) => {
+      const turn = firstTurn(g)
+      const lead = leadOf(g, isLive)
+      if (lead === 'file' && g.ref?.path && (await openFile($, g.ref.path))) return
+      if (g.ref?.url && (await openPage($, g.ref.url))) return
+      if (isLive) {
+        const prompt = raw.turnRows.find(t => t.turn === turn)?.promptId
+        for (const id of [g.ref?.toolUseId, g.ref?.messageId, prompt]) if (id && (await reveal($, id))) return
+      }
+      if (turn !== undefined) {
+        setFilter({ ...filter, turns: [turn] })
+        $.ui.toast(lead === 'file' ? `Could not open ${g.ref?.path}; filtered to turn ${turn} instead.` : `Filtered to turn ${turn}, where it first came in.`)
+      }
+    }
 
     // filter actions: a row's click picks it alone, or drops it when it is the one picked
     const onlyTurn = (turn: number) =>
@@ -686,13 +806,23 @@ export const register: Register = on => {
                   details.length === 0
                     ? <Text dimColor>Nothing of this kind in the picked turns.</Text>
                     : rows(
-                        details.map(g => ({
-                          key: `d-${cat}-${g.label}`,
-                          label: g.label,
-                          segs: [{ v: g.cost, cls: 'read' }],
-                          value: `${money(g.cost)}${g.count > 1 ? ` · ${g.count}×` : ''}`,
-                          title: `${g.label}\n${money(g.cost)} · ${tok(g.tokens)} tokens added${g.count > 1 ? ` · ${g.count} pieces` : ''}`,
-                        })),
+                        details.map(g => {
+                          const lead = leadOf(g, isLive)
+                          const where = g.ref?.path ?? g.ref?.url
+                          return {
+                            key: `d-${cat}-${g.label}`,
+                            label: lead === 'none' ? g.label : `${g.label} ↗`,
+                            segs: [{ v: g.cost, cls: 'read' }],
+                            value: `${money(g.cost)}${g.count > 1 ? ` · ${g.count}×` : ''}`,
+                            title: [
+                              g.label,
+                              `${money(g.cost)} · ${tok(g.tokens)} tokens added${g.count > 1 ? ` · ${g.count} pieces` : ''}`,
+                              ...(where && where !== g.label ? [where] : []),
+                              ...(lead === 'none' ? [] : [lead === 'turn' ? `${LEAD_HINT.turn} (${firstTurn(g)})` : LEAD_HINT[lead]]),
+                            ].join('\n'),
+                            onPress: lead === 'none' ? undefined : () => void goTo(g),
+                          }
+                        }),
                       ),
                 ]
               })),
@@ -746,8 +876,8 @@ export const register: Register = on => {
           .sort((a, b) => a.label.localeCompare(b.label))
           .map(c => ({ value: c.id, label: c.label })),
       ]
-      const filterBar = (
-        <Box flexDirection="row" alignItems="center" gap={1} flexWrap="wrap" marginTop={1}>
+      const filterControls = (
+        <Box flexDirection="row" alignItems="center" gap={1} flexWrap="wrap" flexShrink={1}>
           <Text dimColor>Filter</Text>
           {Select ? (
             <Select
@@ -787,32 +917,33 @@ export const register: Register = on => {
         </Box>
       )
 
-      // tabs on the left, the two actions as icons on the right
-      const tabBar = (
-        <Box flexDirection="row" justifyContent="space-between" alignItems="center">
-          <Box flexDirection="row" gap={2} flexWrap="wrap">
-            {tabs.map(([id, label]) => (
-              <Button plain key={`tab-${id}`} label={label} onPress={setTab(id)}>
-                {current === id ? (
-                  <Text bold underline color="#2a78d6">
-                    {label}
-                  </Text>
-                ) : (
-                  <Text dimColor>{label}</Text>
-                )}
-              </Button>
-            ))}
-          </Box>
-          <Box flexDirection="row" gap={2}>
-            <Button plain key="refresh" label="Refresh" onPress={refreshNow}>
-              <Text dimColor>⟳</Text>
-            </Button>
-            <Button plain key="export" label="Export as Markdown" onPress={exportReport}>
-              <Text dimColor>⤓</Text>
-            </Button>
+      // the filter on the left; the two secondary actions small and dim on the right
+      const filterBar = (
+        <Box flexDirection="row" justifyContent="space-between" alignItems="center" gap={1} marginTop={1}>
+          {filterControls}
+          <Box flexDirection="row" gap={1} flexShrink={0}>
+            <Button key="refresh" label="⟳" dimColor onPress={refreshNow} />
+            <Button key="export" label="⤓ .md" dimColor onPress={exportReport} />
           </Box>
         </Box>
       )
+
+      // one row of tabs, the picked one drawn as the primary button; where
+      // they would not fit on one row, a dropdown takes their place
+      const tabsPx = tabs.reduce((s, [, label]) => s + label.length * PX_PER_COLUMN + 28, 0) + (tabs.length - 1) * PX_PER_COLUMN
+      const tabBar =
+        tabsPx <= cols * PX_PER_COLUMN || !Select ? (
+          <Box flexDirection="row" gap={1} flexWrap="wrap">
+            {tabs.map(([id, label]) => (
+              <Button key={`tab-${id}`} label={label} variant={current === id ? 'primary' : undefined} dimColor={current !== id} onPress={setTab(id)} />
+            ))}
+          </Box>
+        ) : (
+          <Box flexDirection="row" alignItems="center" gap={1}>
+            <Text dimColor>View</Text>
+            <Select key="tab" options={tabs.map(([value, label]) => ({ value, label }))} value={current} onSelect={(value: string) => void $.state.set(TAB, value)} />
+          </Box>
+        )
 
       return (
         <Box flexDirection="column">

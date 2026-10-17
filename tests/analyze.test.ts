@@ -316,6 +316,31 @@ describe('filter', () => {
     // within a turn that did not touch it, nothing
     expect(detailsOf(r, 'code_write', viewOf({ turns: [2], cats: [] })).every(g => g.cost < 0.01)).toBe(true)
   })
+
+  test('each entry knows where it leads: its file, page or row', () => {
+    const group = (cat: string) => r.groups.find(g => g.cat === cat)
+    expect(group('code_write')?.ref).toEqual({ path: 'src/app.ts', toolUseId: 't2' })
+    expect(group('cmd')?.ref?.toolUseId).toBe('t1')
+    expect(group('termout')?.ref?.toolUseId).toBe('t1')
+    expect(r.groups.find(g => g.label === 'Build the thing please')?.ref?.messageId).toBe('u1')
+    expect(r.turnRows.map(t => t.promptId)).toEqual(['u1', 'u2'])
+    // a page, and a subagent's call: its file still leads somewhere, its row does not
+    const web = [
+      { type: 'user', uuid: 'w0', timestamp: at(0), message: { role: 'user', content: 'look it up' } },
+      { type: 'assistant', uuid: 'w1', timestamp: at(1), message: { id: 'w1', usage: usage(0, 9000, 50, 0), content: [{ type: 'tool_use', id: 'tw', name: 'WebFetch', input: { url: 'https://example.com/a?b=1', prompt: 'x' } }] } },
+      { type: 'user', uuid: 'w2', timestamp: at(2), message: { role: 'user', content: [{ type: 'tool_result', tool_use_id: 'tw', content: 'page '.repeat(500) }] } },
+      { type: 'assistant', uuid: 'w3', timestamp: at(3), message: { id: 'w3', usage: usage(9000, 700, 10, 0), content: [{ type: 'text', text: 'ok' }] } },
+    ]
+    const sub = [
+      { type: 'user', uuid: 'x0', timestamp: at(1.5), message: { role: 'user', content: 'read it' } },
+      { type: 'assistant', uuid: 'x1', timestamp: at(1.6), message: { id: 'x1', usage: usage(0, 5000, 30, 0), content: [{ type: 'tool_use', id: 'tx', name: 'Read', input: { file_path: 'C:/p/notes.md' } }] } },
+      { type: 'user', uuid: 'x2', timestamp: at(1.7), message: { role: 'user', content: [{ type: 'tool_result', tool_use_id: 'tx', content: 'n '.repeat(400) }] } },
+      { type: 'assistant', uuid: 'x3', timestamp: at(1.8), message: { id: 'x3', usage: usage(5000, 400, 10, 0), content: [{ type: 'text', text: 'done' }] } },
+    ]
+    const w = buildReport('w', 'w.jsonl', web, [{ id: 'a', rows: sub }], T0 + 10_000)
+    expect(w.groups.find(g => g.cat === 'web')?.ref).toEqual({ url: 'https://example.com/a?b=1', toolUseId: 'tw' })
+    expect(w.groups.find(g => g.cat === 'doc_read')?.ref).toEqual({ path: 'C:/p/notes.md' })
+  })
 })
 
 describe('scan', () => {
@@ -340,5 +365,26 @@ describe('footer', () => {
     // the card leaves 44px under the summary for the buttons laid over it
     const inner = summaryCard(r).match(/height="(\d+)"/)![1]
     expect(pop.match(/height="(\d+)"/)![1]).toBe(String(Number(inner) + 28 + 30 + 44))
+  })
+
+  test('the popover card is compact: the width it is given, no taller than the app’s own', () => {
+    const live = {
+      ...r,
+      live: {
+        contextTokens: 63_000,
+        contextWindow: 1_000_000,
+        limits: [
+          { kind: 'five_hour', percentUsed: 77, resetsAt: new Date(T0 + 7_000_000).toISOString(), session: 0.5 },
+          { kind: 'seven_day', percentUsed: 84, resetsAt: new Date(T0 + 40_000_000).toISOString() },
+        ],
+      },
+    }
+    const card = summaryCard(live, { state: 'measuring' }, 360)
+    const [, w, h] = card.match(/width="(\d+)" height="(\d+)"/)!
+    expect(w).toBe('360')
+    expect(Number(h)).toBeLessThan(180)
+    for (const s of ['Session usage', 'Cost at API prices', '5-hour limit', '≈ 0.5%', ' of 77%', 'measuring…', 'Context', '<title>']) {
+      expect(card.includes(s)).toBe(true)
+    }
   })
 })
