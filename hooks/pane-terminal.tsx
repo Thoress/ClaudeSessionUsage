@@ -1,4 +1,4 @@
-import type { EngineInterface, RenderElement, RenderInput } from 'claude-code'
+import type { RenderElement, RenderInput } from 'claude-code'
 
 import type { UsageReport } from '../types'
 import { BUCKETS, CATS } from './analyze'
@@ -6,6 +6,7 @@ import { detailsOf, topGroups } from './filter'
 import { cachingStory, cut, dur, mdAgentTable, mdCostTable, mdToolTable, money, tok } from './format'
 import { paneActions } from './navigate'
 import type { PaneContext } from './pane'
+import type { Host } from './host'
 import {
   CONTENT_LEGEND,
   OVERVIEW_TURNS,
@@ -73,10 +74,10 @@ const running = (r: UsageReport) => {
 }
 
 /** The pane on the terminal: the desktop's tabs, filter and rows, its pictures drawn as text bars and tables. */
-export function renderTerminalPane($: EngineInterface, e: RenderInput<'Pane', 'terminal'>, ctx: PaneContext): RenderElement {
+export function renderTerminalPane(host: Host, e: RenderInput<'Pane', 'terminal'>, ctx: PaneContext): RenderElement {
   const { raw, r, v, base, cols, filter, measure, preview, note, tabs, current, setTab, exportReport, refreshNow } = ctx
-  const act = paneActions($, ctx)
-  const { Box, Text, Button, Select, Code, Markdown } = $.ui.resolve(e)
+  const act = paneActions(host, ctx)
+  const { Box, Text, Button, Select, Code, Markdown } = host.ui.resolve(e)
 
   const heading = (title: string) => (
     <Box marginTop={1}>

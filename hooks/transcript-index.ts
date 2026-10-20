@@ -1,7 +1,8 @@
-import type { EngineInterface } from 'claude-code'
+
 
 import { parseJsonl } from './analyze'
 import { readText } from './transcripts'
+import type { Host } from './host'
 
 // ---------- a transcript, indexed for the previews ----------
 //
@@ -147,10 +148,10 @@ const KEEP = 2
  * `isAnswered` says the index already holds what is asked: rows once written
  * stay as they are, so a grown file need not be read again for it.
  */
-export async function transcriptIndex($: EngineInterface, path: string, isAnswered?: (ix: TranscriptIndex) => boolean): Promise<TranscriptIndex> {
+export async function transcriptIndex(host: Host, path: string, isAnswered?: (ix: TranscriptIndex) => boolean): Promise<TranscriptIndex> {
   const pending = building.get(path)
   if (pending) await pending.catch(() => undefined)
-  const { size, mtimeMs } = await $.fs.stat(path)
+  const { size, mtimeMs } = await host.fs.stat(path)
   const had = indexes.get(path)
   if (had) {
     indexes.delete(path)
@@ -159,7 +160,7 @@ export async function transcriptIndex($: EngineInterface, path: string, isAnswer
     if (size >= had.size && isAnswered?.(had.index)) return had.index
   }
   const build = (async () => {
-    const text = await readText($, path)
+    const text = await readText(host, path)
     const isGrown = had !== undefined && size >= had.size && had.consumed <= text.length && markOf(text, had.consumed) === had.mark
     const { rows, consumed } = rowsFrom(text, isGrown ? had.consumed : 0)
     const index = isGrown ? extendIndex(had.index, rows) : buildIndex(rows)

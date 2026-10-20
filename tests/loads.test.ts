@@ -12,6 +12,6 @@ test('the hooks module loads as the app loads it', async $ => {
   } catch (err) {
     error = (err as Error)?.message ?? String(err)
   }
-  expect(error.includes('did not load')).toBe(false)
+  expect(error.includes('did not load') ? error : '').toBe('')
   expect(error.includes('refused')).toBe(false)
 })
