@@ -223,7 +223,7 @@ describe('the terminal pane', () => {
     expect(d.calls.map(c => c.path)).toEqual(['state.set', 'ui.open'])
     expect(d.calls[0]!.args[1]).toEqual(PREVIEW)
     await d.press('preview-close')
-    expect(d.calls).toEqual([{ path: 'state.set', args: [{ plugin: 'session-insights', key: 'preview' }, null] }])
+    expect(d.calls).toEqual([{ path: 'state.set', args: ['preview', null] }])
   })
 })
 

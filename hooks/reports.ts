@@ -1,18 +1,12 @@
-import type { EngineInterface } from 'claude-code'
+
 
 import type { UsageReport } from '../types'
 import { NO_FILTER } from './filter'
 import { windowShare } from './limits'
 import { liveUsage, sessionCosts, windowStart, withShares } from './shares'
 import { analyze, compact } from './transcripts'
+import type { Host } from './host'
 
-const REPORT = { plugin: 'session-insights', key: 'report' } as const
-const CURRENT = { plugin: 'session-insights', key: 'current' } as const
-const STATUS = { plugin: 'session-insights', key: 'status' } as const
-const FILTER = { plugin: 'session-insights', key: 'filter' } as const
-const MEASURE = { plugin: 'session-insights', key: 'measure' } as const
-const POPOVER = { plugin: 'session-insights', key: 'popover' } as const
-const PREVIEW = { plugin: 'session-insights', key: 'preview' } as const
 
 // ---------- keeping the reports current ----------
 
@@ -20,40 +14,40 @@ const PREVIEW = { plugin: 'session-insights', key: 'preview' } as const
 let measuring: Promise<void> | undefined
 
 /** Adds this session's part to each limit and redraws; the first run scans the week's transcripts. */
-async function measureShares($: EngineInterface): Promise<void> {
-  const { value: r } = await $.state.get(CURRENT)
+async function measureShares(host: Host): Promise<void> {
+  const { value: r } = await host.state.get('current')
   if (!r?.live) return
   const starts = r.live.limits.map(windowStart).filter(Number.isFinite)
   if (starts.length === 0) return
   try {
-    const bySession = await sessionCosts($, Math.min(...starts))
+    const bySession = await sessionCosts(host, Math.min(...starts))
     const measured = r.live.limits.map(l => {
       const start = windowStart(l)
       return Number.isFinite(start) ? { ...l, ...windowShare(l.percentUsed, start, r.sessionId, bySession) } : l
     })
     // the reports may have been replaced meanwhile: add the shares to the newest
-    const { value: now } = await $.state.get(CURRENT)
-    if (now) await $.state.set(CURRENT, withShares(now, measured))
+    const { value: now } = await host.state.get('current')
+    if (now) await host.state.set('current', withShares(now, measured))
     const full = reports.get(r.sessionId)
     if (full) {
-      const { value: ref } = await $.state.get(REPORT)
+      const { value: ref } = await host.state.get('report')
       reports.set(r.sessionId, withShares(full, measured))
-      if (ref?.sessionId === r.sessionId) await $.state.set(REPORT, { sessionId: r.sessionId, rev: ++rev })
+      if (ref?.sessionId === r.sessionId) await host.state.set('report', { sessionId: r.sessionId, rev: ++rev })
     }
-    await $.state.set(MEASURE, { state: 'idle' })
+    await host.state.set('measure', { state: 'idle' })
   } catch (err) {
-    await $.state.set(MEASURE, { state: 'error', error: (err as Error)?.message ?? String(err) })
+    await host.state.set('measure', { state: 'error', error: (err as Error)?.message ?? String(err) })
   }
 }
 
 // what a pane drawn without its report asks for, once a few seconds at most
 let reanalyzedAt = -Infinity
-export function reanalyze($: EngineInterface, sessionId: string) {
-  $.clock.after(0, async () => {
-    const now = await $.clock.now()
+export function reanalyze(host: Host, sessionId: string) {
+  host.clock.after(0, async () => {
+    const now = await host.clock.now()
     if (now - reanalyzedAt < 5000) return
     reanalyzedAt = now
-    await refreshPane($, sessionId)
+    await refreshPane(host, sessionId)
   })
 }
 
@@ -94,29 +88,29 @@ const slim = (r: UsageReport): UsageReport => ({
 })
 
 /** Puts a report on the pane. */
-export async function showReport($: EngineInterface, r: UsageReport) {
+export async function showReport(host: Host, r: UsageReport) {
   reports.set(r.sessionId, r)
-  await $.state.set(REPORT, { sessionId: r.sessionId, rev: ++rev })
+  await host.state.set('report', { sessionId: r.sessionId, rev: ++rev })
 }
 
 /** Analyzes the running session for the footer, and for the pane when it shows this session. */
-export async function refreshCurrent($: EngineInterface): Promise<UsageReport | undefined> {
-  const sessionId = await $.session.id()
-  const r = await analyze($, sessionId).catch(() => undefined)
+export async function refreshCurrent(host: Host): Promise<UsageReport | undefined> {
+  const sessionId = await host.session.id()
+  const r = await analyze(host, sessionId).catch(() => undefined)
   if (!r) return undefined
-  r.live = await liveUsage($).catch(() => undefined)
+  r.live = await liveUsage(host).catch(() => undefined)
   // keep the shares of the last measurement until the new one lands
-  const { value: before } = await $.state.get(CURRENT)
+  const { value: before } = await host.state.get('current')
   const report = before?.live && before.sessionId === sessionId ? withShares(r, before.live.limits) : r
   reports.set(sessionId, report)
-  await $.state.set(CURRENT, compact(slim(report)))
-  const { value: ref } = await $.state.get(REPORT)
-  if (!ref || ref.sessionId === sessionId) await showReport($, report)
+  await host.state.set('current', compact(slim(report)))
+  const { value: ref } = await host.state.get('report')
+  if (!ref || ref.sessionId === sessionId) await showReport(host, report)
   // work that outlives this dispatch runs from a timer
   if (report.live && !measuring) {
-    $.clock.after(0, () => {
+    host.clock.after(0, () => {
       if (measuring) return
-      measuring = measureShares($)
+      measuring = measureShares(host)
         .catch(() => undefined)
         .finally(() => {
           measuring = undefined
@@ -127,24 +121,24 @@ export async function refreshCurrent($: EngineInterface): Promise<UsageReport | 
 }
 
 /** Analyzes a session for the pane: the running one, or an earlier one by id. */
-export async function refreshPane($: EngineInterface, sessionId: string): Promise<UsageReport | undefined> {
-  await $.state.set(STATUS, 'Analyzing…')
+export async function refreshPane(host: Host, sessionId: string): Promise<UsageReport | undefined> {
+  await host.state.set('status', 'Analyzing…')
   try {
     let r: UsageReport | undefined
-    if (sessionId === (await $.session.id())) {
-      r = await refreshCurrent($)
-      if (r) await showReport($, r)
+    if (sessionId === (await host.session.id())) {
+      r = await refreshCurrent(host)
+      if (r) await showReport(host, r)
     } else {
-      r = await analyze($, sessionId)
-      await showReport($, r)
-      await $.state.set(FILTER, NO_FILTER)
-      await $.state.set(PREVIEW, null)
+      r = await analyze(host, sessionId)
+      await showReport(host, r)
+      await host.state.set('filter', NO_FILTER)
+      await host.state.set('preview', null)
     }
     if (!r) throw new Error(`No transcript found for session ${sessionId}.`)
-    await $.state.set(STATUS, '')
+    await host.state.set('status', '')
     return r
   } catch (err) {
-    await $.state.set(STATUS, `Could not analyze: ${(err as Error)?.message ?? String(err)}`)
+    await host.state.set('status', `Could not analyze: ${(err as Error)?.message ?? String(err)}`)
     return undefined
   }
 }
@@ -153,18 +147,18 @@ export async function refreshPane($: EngineInterface, sessionId: string): Promis
 // for one; at most every few seconds, so a session with no transcript yet
 // does not ask on every draw
 let warmedAt = -Infinity
-export function warmUp($: EngineInterface) {
-  $.clock.after(0, async () => {
-    const now = await $.clock.now()
+export function warmUp(host: Host) {
+  host.clock.after(0, async () => {
+    const now = await host.clock.now()
     if (now - warmedAt < 5000) return
     warmedAt = now
-    await refreshCurrent($)
+    await refreshCurrent(host)
   })
 }
 
-export async function closePopover($: EngineInterface) {
-  const { value: isOpen = false } = await $.state.get(POPOVER)
-  if (isOpen) await $.state.set(POPOVER, false)
+export async function closePopover(host: Host) {
+  const { value: isOpen = false } = await host.state.get('popover')
+  if (isOpen) await host.state.set('popover', false)
 }
 
 export const activeMsOf = (r: UsageReport) => r.time.filter(t => t.id !== 'idle').reduce((s, t) => s + t.ms, 0)

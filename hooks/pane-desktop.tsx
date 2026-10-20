@@ -1,4 +1,4 @@
-import type { EngineInterface, RenderElement, RenderInput, RenderSurface } from 'claude-code'
+import type { RenderElement, RenderInput, RenderSurface } from 'claude-code'
 
 import { CATS } from './analyze'
 import {
@@ -23,6 +23,7 @@ import { cut, money } from './format'
 import { paneActions } from './navigate'
 import type { PaneContext } from './pane'
 import { memoize } from './reports'
+import type { Host } from './host'
 import {
   CONTENT_INFO,
   CONTENT_LEGEND,
@@ -44,12 +45,11 @@ import {
   turnTimeRows,
 } from './rows'
 
-const VIEW = { plugin: 'session-insights', key: 'view' } as const
 
 // the full view of a preview: a pane of its own, which the surface scrolls
-export async function renderViewPane($: EngineInterface, e: RenderInput<'Pane'>): Promise<RenderElement> {
-  const { value: view = null } = await $.state.get(VIEW)
-  const { Box, Text, Code, Markdown } = $.ui.resolve(e)
+export async function renderViewPane(host: Host, e: RenderInput<'Pane'>): Promise<RenderElement> {
+  const { value: view = null } = await host.state.get('view')
+  const { Box, Text, Code, Markdown } = host.ui.resolve(e)
   if (!view) {
     return (
       <Box flexDirection="column">
@@ -73,11 +73,11 @@ export async function renderViewPane($: EngineInterface, e: RenderInput<'Pane'>)
 }
 
 /** The pane on the surfaces that draw SVG. */
-export function renderDesktopPane($: EngineInterface, e: RenderInput<'Pane', Exclude<RenderSurface, 'terminal'>>, ctx: PaneContext): RenderElement {
+export function renderDesktopPane(host: Host, e: RenderInput<'Pane', Exclude<RenderSurface, 'terminal'>>, ctx: PaneContext): RenderElement {
   const { raw, r, v, base, cols, filter, measure, preview, note, tabs, current, setTab, exportReport, refreshNow } = ctx
-  const act = paneActions($, ctx)
+  const act = paneActions(host, ctx)
 
-  const els = $.ui.resolve(e)
+  const els = host.ui.resolve(e)
   const { Box, Text, Button, Svg } = els
   // mobile draws no dropdown: there the chips and the rows filter
   const Select = 'Select' in els ? els.Select : undefined

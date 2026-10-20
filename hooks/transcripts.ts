@@ -1,40 +1,41 @@
-import type { EngineInterface } from 'claude-code'
+
 
 import type { UsageReport } from '../types'
 import { type Chain, chainOf, parseJsonl, reportOf, turnAt } from './analyze'
+import type { Host } from './host'
 
 const FS_READ_LIMIT = 4 * 1024 * 1024
 
 // ---------- finding and reading transcripts ----------
 
-export async function configDir($: EngineInterface): Promise<string> {
-  const custom = await $.env.get('CLAUDE_CONFIG_DIR')
+export async function configDir(host: Host): Promise<string> {
+  const custom = await host.env.get('CLAUDE_CONFIG_DIR')
   if (custom) return custom
-  const home = (await $.env.get('USERPROFILE')) ?? (await $.env.get('HOME')) ?? ''
+  const home = (await host.env.get('USERPROFILE')) ?? (await host.env.get('HOME')) ?? ''
   return `${home}/.claude`
 }
 
-export async function findTranscript($: EngineInterface, id: string): Promise<string | undefined> {
-  const projects = `${await configDir($)}/projects`
-  const guesses = [await $.session.root(), await $.session.cwd()].map(p => p.replace(/[^a-zA-Z0-9]/g, '-'))
+export async function findTranscript(host: Host, id: string): Promise<string | undefined> {
+  const projects = `${await configDir(host)}/projects`
+  const guesses = [await host.session.root(), await host.session.cwd()].map(p => p.replace(/[^a-zA-Z0-9]/g, '-'))
   for (const g of guesses) {
     const f = `${projects}/${g}/${id}.jsonl`
-    if (await $.fs.exists(f)) return f
+    if (await host.fs.exists(f)) return f
   }
-  for (const d of await $.fs.list(projects).catch(() => [])) {
+  for (const d of await host.fs.list(projects).catch(() => [])) {
     if (d.kind !== 'dir') continue
     const f = `${projects}/${d.name}/${id}.jsonl`
-    if (await $.fs.exists(f)) return f
+    if (await host.fs.exists(f)) return f
   }
   return undefined
 }
 
-const isWindows = async ($: EngineInterface, path: string) => /^[A-Za-z]:/.test(path) || (await $.env.get('OS')) === 'Windows_NT'
+const isWindows = async (host: Host, path: string) => /^[A-Za-z]:/.test(path) || (await host.env.get('OS')) === 'Windows_NT'
 
 /** What a child writes to standard output; undefined when it cannot start or fails. */
-async function output($: EngineInterface, argv: string[]): Promise<string | undefined> {
+async function output(host: Host, argv: string[]): Promise<string | undefined> {
   try {
-    const child = $.process.spawn({ argv })
+    const child = host.process.spawn({ argv })
     let text = ''
     for await (const chunk of child) if (chunk.stream === 'stdout') text += chunk.text
     return (await child.result).code === 0 ? text : undefined
@@ -45,7 +46,7 @@ async function output($: EngineInterface, argv: string[]): Promise<string | unde
 
 // Windows ships curl (since 10 1803); it reads a file:// URL, a byte range
 // of it too, far faster than `type` pipes a large file
-const curl = async ($: EngineInterface) => `${(await $.env.get('SystemRoot')) ?? 'C:\\Windows'}\\System32\\curl.exe`
+const curl = async (host: Host) => `${(await host.env.get('SystemRoot')) ?? 'C:\\Windows'}\\System32\\curl.exe`
 const fileUrl = (path: string) =>
   'file:///' +
   path
@@ -54,28 +55,28 @@ const fileUrl = (path: string) =>
     .map((part, k) => (k === 0 && /^[A-Za-z]:$/.test(part) ? part : encodeURIComponent(part)))
     .join('/')
 
-/** Reads a text file of any size: past $.fs.read's 4 MiB, through a child. */
-export async function readText($: EngineInterface, path: string): Promise<string> {
-  const { size } = await $.fs.stat(path)
-  if (size <= FS_READ_LIMIT) return $.fs.read(path)
-  const text = (await isWindows($, path))
-    ? ((await output($, [await curl($), '-sS', fileUrl(path)])) ?? (await output($, ['cmd', '/d', '/c', 'type', path.replace(/\//g, '\\')])))
-    : await output($, ['cat', path])
+/** Reads a text file of any size: past host.fs.read's 4 MiB, through a child. */
+export async function readText(host: Host, path: string): Promise<string> {
+  const { size } = await host.fs.stat(path)
+  if (size <= FS_READ_LIMIT) return host.fs.read(path)
+  const text = (await isWindows(host, path))
+    ? ((await output(host, [await curl(host), '-sS', fileUrl(path)])) ?? (await output(host, ['cmd', '/d', '/c', 'type', path.replace(/\//g, '\\')])))
+    : await output(host, ['cat', path])
   if (text === undefined) throw new Error(`Could not read ${path}.`)
   return text
 }
 
 /** The text from a point on: `bytes` into the file, the same point `chars` into its text. */
-async function readFrom($: EngineInterface, path: string, at: Offset, size: number): Promise<string> {
-  if (at.bytes <= 0) return readText($, path)
+async function readFrom(host: Host, path: string, at: Offset, size: number): Promise<string> {
+  if (at.bytes <= 0) return readText(host, path)
   if (size <= FS_READ_LIMIT) {
-    const text = await $.fs.read(path).catch(() => undefined)
+    const text = await host.fs.read(path).catch(() => undefined)
     if (text !== undefined) return text.slice(at.chars)
   }
-  const part = (await isWindows($, path))
-    ? await output($, [await curl($), '-sS', '-r', `${at.bytes}-`, fileUrl(path)])
-    : await output($, ['tail', '-c', `+${at.bytes + 1}`, path])
-  return part ?? (await readText($, path)).slice(at.chars)
+  const part = (await isWindows(host, path))
+    ? await output(host, [await curl(host), '-sS', '-r', `${at.bytes}-`, fileUrl(path)])
+    : await output(host, ['tail', '-c', `+${at.bytes + 1}`, path])
+  return part ?? (await readText(host, path)).slice(at.chars)
 }
 
 // ---------- following a transcript as it grows ----------
@@ -93,13 +94,13 @@ export type Reader = {
   readFrom: (path: string, at: Offset, size: number) => Promise<string>
 }
 
-const readerOf = ($: EngineInterface): Reader => ({
-  stat: path => $.fs.stat(path).then(
+const readerOf = (host: Host): Reader => ({
+  stat: path => host.fs.stat(path).then(
     s => ({ size: s.size, mtimeMs: s.mtimeMs }),
     () => undefined,
   ),
-  list: async dir => ((await $.fs.exists(dir)) ? (await $.fs.list(dir)).filter(f => f.kind === 'file' && f.name.endsWith('.jsonl')) : []),
-  readFrom: (path, at, size) => readFrom($, path, at, size),
+  list: async dir => ((await host.fs.exists(dir)) ? (await host.fs.list(dir)).filter(f => f.kind === 'file' && f.name.endsWith('.jsonl')) : []),
+  readFrom: (path, at, size) => readFrom(host, path, at, size),
 })
 
 /** One file read up to `bytes`, into its chain. */
@@ -262,10 +263,10 @@ export function follow(reader: Reader, sessionId: string, file: string, now: num
   return run
 }
 
-export async function analyze($: EngineInterface, sessionId: string): Promise<UsageReport> {
-  const file = await findTranscript($, sessionId)
+export async function analyze(host: Host, sessionId: string): Promise<UsageReport> {
+  const file = await findTranscript(host, sessionId)
   if (!file) throw new Error(`No transcript found for session ${sessionId}.`)
-  return follow(readerOf($), sessionId, file, await $.clock.now())
+  return follow(readerOf(host), sessionId, file, await host.clock.now())
 }
 
 /** Rounds every fraction to 5 significant digits: the state stays small. */

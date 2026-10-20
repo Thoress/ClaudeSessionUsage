@@ -1,17 +1,12 @@
-import type { EngineInterface, RenderElement, RenderInput } from 'claude-code'
+import type { RenderElement, RenderInput } from 'claude-code'
 
 import type { Filter, Measure, Preview, UsageReport } from '../types'
 import { COMMAND } from './constants'
 import { NO_FILTER, applyFilter, viewOf } from './filter'
 import { toMarkdown } from './format'
 import { memoize, reanalyze, refreshPane, reports } from './reports'
+import type { Host } from './host'
 
-const REPORT = { plugin: 'session-insights', key: 'report' } as const
-const TAB = { plugin: 'session-insights', key: 'tab' } as const
-const STATUS = { plugin: 'session-insights', key: 'status' } as const
-const FILTER = { plugin: 'session-insights', key: 'filter' } as const
-const MEASURE = { plugin: 'session-insights', key: 'measure' } as const
-const PREVIEW = { plugin: 'session-insights', key: 'preview' } as const
 
 const TABS: [string, string][] = [
   ['overview', 'Overview'],
@@ -46,19 +41,19 @@ export type PaneContext = {
 }
 
 /** Reads what the pane draws from; without a report, only the status line. */
-export async function readPane($: EngineInterface, e: RenderInput<'Pane'>): Promise<PaneContext | { raw: null; note: string }> {
-  const { value: ref = null } = await $.state.get(REPORT)
+export async function readPane(host: Host, e: RenderInput<'Pane'>): Promise<PaneContext | { raw: null; note: string }> {
+  const { value: ref = null } = await host.state.get('report')
   const raw = ref ? (reports.get(ref.sessionId) ?? null) : null
   // the module was reloaded since: its reports are gone, analyze again
-  if (ref && !raw) reanalyze($, ref.sessionId)
-  const { value: stored = 'overview' } = await $.state.get(TAB)
-  const { value: note = '' } = await $.state.get(STATUS)
-  const { value: filter = NO_FILTER } = await $.state.get(FILTER)
-  const { value: measure } = await $.state.get(MEASURE)
-  const { value: preview = null } = await $.state.get(PREVIEW)
+  if (ref && !raw) reanalyze(host, ref.sessionId)
+  const { value: stored = 'overview' } = await host.state.get('tab')
+  const { value: note = '' } = await host.state.get('status')
+  const { value: filter = NO_FILTER } = await host.state.get('filter')
+  const { value: measure } = await host.state.get('measure')
+  const { value: preview = null } = await host.state.get('preview')
   const cols = Math.max(50, Math.min(160, e.props.bodyColumns ?? e.viewport?.columns ?? 100))
-  const setTab = (id: string) => () => void $.state.set(TAB, id)
-  const setFilter = (next: Filter) => void $.state.set(FILTER, next)
+  const setTab = (id: string) => () => void host.state.set('tab', id)
+  const setFilter = (next: Filter) => void host.state.set('filter', next)
 
   if (!raw) return { raw: null, note }
 
@@ -70,18 +65,18 @@ export async function readPane($: EngineInterface, e: RenderInput<'Pane'>): Prom
   const wanted = OLD_TABS[stored] ?? stored
   const current = tabs.some(([id]) => id === wanted) ? wanted : 'overview'
   const exportReport = async () => {
-    const path = `${await $.session.cwd()}/session-usage-${raw.sessionId.slice(0, 8)}.md`
-    await $.fs.write(path, toMarkdown(raw))
-    $.ui.toast(`Written to ${path}`)
+    const path = `${await host.session.cwd()}/session-usage-${raw.sessionId.slice(0, 8)}.md`
+    await host.fs.write(path, toMarkdown(raw))
+    host.ui.toast(`Written to ${path}`)
   }
-  const refreshNow = () => void refreshPane($, raw.sessionId)
-  const isLive = raw.sessionId === (await $.session.id())
+  const refreshNow = () => void refreshPane(host, raw.sessionId)
+  const isLive = raw.sessionId === (await host.session.id())
   return { raw, r, v, base, cols, filter, measure, preview, note, tabs, current, isLive, setTab, setFilter, exportReport, refreshNow }
 }
 
 /** The pane before there is a report: the status, else how to get one. */
-export function emptyPane($: EngineInterface, e: RenderInput<'Pane'>, note: string): RenderElement {
-  const { Box, Text } = $.ui.resolve(e)
+export function emptyPane(host: Host, e: RenderInput<'Pane'>, note: string): RenderElement {
+  const { Box, Text } = host.ui.resolve(e)
   return (
     <Box flexDirection="column">
       <Text dimColor>{note || `Run /${COMMAND} to analyze this session.`}</Text>

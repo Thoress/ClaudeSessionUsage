@@ -1,14 +1,14 @@
-import type { EngineInterface } from 'claude-code'
+
 
 import type { LimitWindow, LiveUsage, UsageReport } from '../types'
 import { type CachedFile, type CostPoint, WINDOW_MS, pack, requestCosts, scanLine, unpack } from './limits'
 import { configDir } from './transcripts'
+import type { Host } from './host'
 
-const MEASURE = { plugin: 'session-insights', key: 'measure' } as const
 
 // ---------- every local session's requests, for the limits' shares ----------
 
-// each transcript's request costs, by path, kept in $.store across sessions
+// each transcript's request costs, by path, kept in host.store across sessions
 // (a finished session's file never changes, so it is scanned once)
 const COSTS_KEY = 'costs'
 let costCache: Record<string, CachedFile> | undefined
@@ -18,18 +18,18 @@ type Transcript = { path: string; size: number; mtimeMs: number; session: string
 const norm = (p: string) => p.replace(/\\/g, '/').toLowerCase()
 
 /** Every local transcript, main conversation or subagent, written to since `since`. */
-async function recentTranscripts($: EngineInterface, since: number): Promise<Transcript[]> {
-  const projects = `${await configDir($)}/projects`
+async function recentTranscripts(host: Host, since: number): Promise<Transcript[]> {
+  const projects = `${await configDir(host)}/projects`
   const out: Transcript[] = []
-  for (const d of await $.fs.list(projects).catch(() => [])) {
+  for (const d of await host.fs.list(projects).catch(() => [])) {
     if (d.kind !== 'dir') continue
     const dir = `${projects}/${d.name}`
-    for (const f of await $.fs.list(dir).catch(() => [])) {
+    for (const f of await host.fs.list(dir).catch(() => [])) {
       if (f.kind !== 'file' || !f.name.endsWith('.jsonl') || f.mtimeMs < since) continue
       const session = f.name.slice(0, -'.jsonl'.length)
       out.push({ path: `${dir}/${f.name}`, size: f.size, mtimeMs: f.mtimeMs, session })
       const sub = `${dir}/${session}/subagents`
-      for (const s of await $.fs.list(sub).catch(() => [])) {
+      for (const s of await host.fs.list(sub).catch(() => [])) {
         if (s.kind === 'file' && s.name.endsWith('.jsonl') && s.mtimeMs >= since) {
           out.push({ path: `${sub}/${s.name}`, size: s.size, mtimeMs: s.mtimeMs, session })
         }
@@ -45,7 +45,7 @@ async function recentTranscripts($: EngineInterface, since: number): Promise<Tra
  * and hands over only the responses' usage: PowerShell's Select-String on
  * Windows, grep elsewhere.
  */
-async function scan($: EngineInterface, paths: string[]): Promise<Map<string, CostPoint[]>> {
+async function scan(host: Host, paths: string[]): Promise<Map<string, CostPoint[]>> {
   const out = new Map<string, CostPoint[]>()
   const put = (file: string, p: CostPoint) => {
     const key = norm(file)
@@ -53,14 +53,14 @@ async function scan($: EngineInterface, paths: string[]): Promise<Map<string, Co
     if (list) list.push(p)
     else out.set(key, [p])
   }
-  if ((await $.env.get('OS')) === 'Windows_NT') {
-    const tmp = (await $.env.get('TEMP')) ?? (await configDir($))
+  if ((await host.env.get('OS')) === 'Windows_NT') {
+    const tmp = (await host.env.get('TEMP')) ?? (await configDir(host))
     const list = `${tmp}\\session-insights-scan.txt`
-    await $.fs.write(list, paths.map(p => p.replace(/\//g, '\\')).join('\r\n'))
-    const script = `${$.plugin.root}/hooks/scan.ps1`.replace(/\//g, '\\')
+    await host.fs.write(list, paths.map(p => p.replace(/\//g, '\\')).join('\r\n'))
+    const script = `${host.root}/hooks/scan.ps1`.replace(/\//g, '\\')
     let rest = ''
     const argv = ['powershell', '-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-File', script, list]
-    for await (const chunk of $.process.spawn({ argv })) {
+    for await (const chunk of host.process.spawn({ argv })) {
       if (chunk.stream !== 'stdout') continue
       const lines = (rest + chunk.text).split('\n')
       rest = lines.pop() ?? ''
@@ -75,7 +75,7 @@ async function scan($: EngineInterface, paths: string[]): Promise<Map<string, Co
     for (let k = 0; k < paths.length; k += 50) {
       let text = ''
       const argv = ['grep', '-F', '-H', '--null', '"output_tokens"', ...paths.slice(k, k + 50)]
-      for await (const chunk of $.process.spawn({ argv })) if (chunk.stream === 'stdout') text += chunk.text
+      for await (const chunk of host.process.spawn({ argv })) if (chunk.stream === 'stdout') text += chunk.text
       const byFile = new Map<string, string[]>()
       for (const line of text.split('\n')) {
         const i = line.indexOf('\0')
@@ -96,19 +96,19 @@ async function scan($: EngineInterface, paths: string[]): Promise<Map<string, Co
 }
 
 /** Each local session's requests since `since`, scanning only files the cache does not hold as they are. */
-export async function sessionCosts($: EngineInterface, since: number): Promise<Map<string, CostPoint[]>> {
+export async function sessionCosts(host: Host, since: number): Promise<Map<string, CostPoint[]>> {
   if (!costCache) {
-    const stored = await $.store.get(COSTS_KEY).catch(() => undefined)
+    const stored = await host.store.get(COSTS_KEY).catch(() => undefined)
     costCache = stored && typeof stored === 'object' ? (stored as Record<string, CachedFile>) : {}
   }
   const cache = costCache
-  const files = await recentTranscripts($, since)
+  const files = await recentTranscripts(host, since)
   const stampOf = (f: Transcript) => `${f.size}:${f.mtimeMs}`
   const stale = files.filter(f => cache[norm(f.path)]?.stamp !== stampOf(f))
   let isChanged = false
   if (stale.length > 0) {
-    await $.state.set(MEASURE, { state: 'measuring', files: stale.length })
-    const scanned = await scan($, stale.map(f => f.path))
+    await host.state.set('measure', { state: 'measuring', files: stale.length })
+    const scanned = await scan(host, stale.map(f => f.path))
     for (const f of stale) cache[norm(f.path)] = { stamp: stampOf(f), mtimeMs: f.mtimeMs, points: pack(scanned.get(norm(f.path)) ?? []) }
     isChanged = true
   }
@@ -119,7 +119,7 @@ export async function sessionCosts($: EngineInterface, since: number): Promise<M
       isChanged = true
     }
   }
-  if (isChanged) await $.store.set(COSTS_KEY, cache).catch(() => undefined)
+  if (isChanged) await host.store.set(COSTS_KEY, cache).catch(() => undefined)
   const bySession = new Map<string, CostPoint[]>()
   for (const f of files) {
     const points = unpack(cache[norm(f.path)]?.points ?? [])
@@ -143,14 +143,14 @@ const LIMITS_KEY = 'last-limits'
 type StoredLimits = { at: number; limits: LimitWindow[] }
 
 /** What only the running session knows: the context fill and the rate limits, as the API reports them. */
-export async function liveUsage($: EngineInterface): Promise<LiveUsage> {
-  const usage = await $.session.usage()
-  const now = await $.clock.now()
+export async function liveUsage(host: Host): Promise<LiveUsage> {
+  const usage = await host.session.usage()
+  const now = await host.clock.now()
   let limits: LimitWindow[] = usage.rateLimits.map(l => ({ kind: l.kind, percentUsed: l.percentUsed, resetsAt: l.resetsAt }))
   if (limits.length > 0) {
-    await $.store.set(LIMITS_KEY, { at: now, limits } satisfies StoredLimits).catch(() => undefined)
+    await host.store.set(LIMITS_KEY, { at: now, limits } satisfies StoredLimits).catch(() => undefined)
   } else {
-    const stored = (await $.store.get(LIMITS_KEY).catch(() => undefined)) as StoredLimits | undefined
+    const stored = (await host.store.get(LIMITS_KEY).catch(() => undefined)) as StoredLimits | undefined
     // a reading whose window has reset since says nothing any more
     limits = (stored?.limits ?? [])
       .filter(l => !l.resetsAt || Date.parse(l.resetsAt) > now)

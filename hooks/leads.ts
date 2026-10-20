@@ -1,12 +1,12 @@
-import type { EngineInterface } from 'claude-code'
+
 
 import type { Group, Preview, UsageReport } from '../types'
 import { VIEW_PANE } from './constants'
 import { cut, tok } from './format'
 import { type TranscriptIndex, textAt, transcriptIndex } from './transcript-index'
 import { readText } from './transcripts'
+import type { Host } from './host'
 
-const VIEW = { plugin: 'session-insights', key: 'view' } as const
 
 /// ---------- leading from a details entry to what it was ----------
 
@@ -45,27 +45,27 @@ export const leadHint = (lead: Lead, g: Group) =>
   })[lead]
 
 /** Runs the first of `tries` that exits 0. */
-async function runFirst($: EngineInterface, tries: string[][]): Promise<boolean> {
+async function runFirst(host: Host, tries: string[][]): Promise<boolean> {
   for (const argv of tries) {
-    const r = await $.process.run(argv, { timeoutMs: 15_000 }).catch(() => undefined)
+    const r = await host.process.run(argv, { timeoutMs: 15_000 }).catch(() => undefined)
     if (r?.exitCode === 0) return true
   }
   return false
 }
 
-export async function openPage($: EngineInterface, url: string): Promise<boolean> {
+export async function openPage(host: Host, url: string): Promise<boolean> {
   if (!/^https?:\/\//i.test(url)) return false
-  return (await $.env.get('OS')) === 'Windows_NT'
-    ? runFirst($, [['rundll32', 'url.dll,FileProtocolHandler', url]])
-    : runFirst($, [['open', url], ['xdg-open', url]])
+  return (await host.env.get('OS')) === 'Windows_NT'
+    ? runFirst(host, [['rundll32', 'url.dll,FileProtocolHandler', url]])
+    : runFirst(host, [['open', url], ['xdg-open', url]])
 }
 
 /**
  * Shows a file in the app's Files pane. The app opens only files inside the
  * session's folders there; for any other it answers an error.
  */
-export async function showInFilesPane($: EngineInterface, path: string): Promise<boolean> {
-  const shown = await $.mcp.call('ccd_view', 'show_pane', { pane: 'file', path }).catch(() => undefined)
+export async function showInFilesPane(host: Host, path: string): Promise<boolean> {
+  const shown = await host.mcp.call('ccd_view', 'show_pane', { pane: 'file', path }).catch(() => undefined)
   return shown !== undefined && !shown.isError
 }
 
@@ -73,9 +73,9 @@ export const cutTo = (s: string, max: number): { text: string; note?: string } =
   s.length > max ? { text: s.slice(0, max), note: `first ${tok(max)} of ${tok(s.length)} characters` } : { text: s }
 
 /** A file's text, for the pane; undefined when it is gone or not text. */
-export async function filePreview($: EngineInterface, path: string): Promise<Preview | undefined> {
-  if (!(await $.fs.exists(path).catch(() => false))) return undefined
-  const text = await readText($, path).catch(() => undefined)
+export async function filePreview(host: Host, path: string): Promise<Preview | undefined> {
+  if (!(await host.fs.exists(path).catch(() => false))) return undefined
+  const text = await readText(host, path).catch(() => undefined)
   if (text === undefined || text.includes('\u0000')) return undefined
   const { text: source, note } = cutTo(text.replace(/\r\n/g, '\n'), PREVIEW_CHARS)
   return { title: path, source, path, note }
@@ -123,8 +123,8 @@ export function hasContent(ix: TranscriptIndex, g: Group): boolean {
 }
 
 /** The entry's first piece, found again in the transcript: a message's text, or a tool call with its result. */
-export async function contentPreview($: EngineInterface, raw: UsageReport, g: Group): Promise<Preview | undefined> {
-  return contentFromIndex(await transcriptIndex($, raw.file, ix => hasContent(ix, g)), g)
+export async function contentPreview(host: Host, raw: UsageReport, g: Group): Promise<Preview | undefined> {
+  return contentFromIndex(await transcriptIndex(host, raw.file, ix => hasContent(ix, g)), g)
 }
 
 /**
@@ -194,16 +194,16 @@ export function turnMarkdown(ix: TranscriptIndex, raw: UsageReport, turn: number
 }
 
 /** One turn as it went: the prompt, Claude's replies, and a line per tool call. */
-export async function turnPreview($: EngineInterface, raw: UsageReport, turn: number): Promise<Preview | undefined> {
+export async function turnPreview(host: Host, raw: UsageReport, turn: number): Promise<Preview | undefined> {
   if (!raw.turnRows.some(t => t.turn === turn)) return undefined
-  return turnMarkdown(await transcriptIndex($, raw.file, ix => turnRange(ix, raw, turn)?.isWhole === true), raw, turn)
+  return turnMarkdown(await transcriptIndex(host, raw.file, ix => turnRange(ix, raw, turn)?.isWhole === true), raw, turn)
 }
 
 /** Opens a preview whole in a tab of its own, which scrolls. */
-export async function openView($: EngineInterface, p: Preview) {
-  await $.state.set(VIEW, p)
+export async function openView(host: Host, p: Preview) {
+  await host.state.set('view', p)
   const name = p.path ? (p.path.split(/[\\/]/).pop() ?? p.title) : p.title
-  await $.ui.open({ id: VIEW_PANE, title: cut(name, 40), columns: 110 })
+  await host.ui.open({ id: VIEW_PANE, title: cut(name, 40), columns: 110 })
 }
 
 // the prompts' rows as the chat draws them: their text → the id a scroll takes
@@ -211,14 +211,14 @@ export const promptRows = new Map<string, string>()
 export const promptKey = (s: string) => s.replace(/<[^>]+>/g, ' ').replace(/\s+/g, ' ').trim().slice(0, 60)
 
 /** Scrolls the chat to a turn's prompt; the reason when it cannot. */
-export async function jumpToTurn($: EngineInterface, raw: UsageReport, turn: number): Promise<string | undefined> {
+export async function jumpToTurn(host: Host, raw: UsageReport, turn: number): Promise<string | undefined> {
   const row = raw.turnRows.find(t => t.turn === turn)
   if (!row) return `turn ${turn} is not in the report`
   const ids = [promptRows.get(promptKey(row.prompt)), row.promptId].filter((id): id is string => Boolean(id))
   if (ids.length === 0) return 'its prompt has not been drawn in the chat'
   let reason = ''
   for (const requestId of ids) {
-    const r = await $.ui.scroll({ to: { requestId }, block: 'start' }).catch((err: unknown) => ({ deny: (err as Error)?.message ?? String(err) }))
+    const r = await host.ui.scroll({ to: { requestId }, block: 'start' }).catch((err: unknown) => ({ deny: (err as Error)?.message ?? String(err) }))
     if (!r.deny) return undefined
     reason = r.deny
   }

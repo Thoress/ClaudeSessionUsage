@@ -1,15 +1,12 @@
-import type { EngineInterface, RenderElement, RenderInput } from 'claude-code'
+import type { RenderElement, RenderInput } from 'claude-code'
 
 import type { UsageReport } from '../types'
 import { summaryCard, svgSize } from './charts'
 import { PANE, PX_PER_COLUMN } from './constants'
 import { dur, money, tok } from './format'
 import { activeMsOf, refreshPane, reports, warmUp } from './reports'
+import type { Host } from './host'
 
-const REPORT = { plugin: 'session-insights', key: 'report' } as const
-const CURRENT = { plugin: 'session-insights', key: 'current' } as const
-const MEASURE = { plugin: 'session-insights', key: 'measure' } as const
-const POPOVER = { plugin: 'session-insights', key: 'popover' } as const
 
 /** One line per figure, for the footer's hover. */
 function summaryText(r: UsageReport): string {
@@ -35,20 +32,19 @@ function summaryText(r: UsageReport): string {
 // context's fill. A click opens the short summary in the band above the
 // prompt, the nearest place to the button that draws a card.
 export async function renderSessionMode(
-  $: EngineInterface,
+  host: Host,
   e: RenderInput<'SessionMode'>,
-  next: (e: RenderInput<'SessionMode'>) => Promise<RenderElement>,
-): Promise<RenderElement> {
-  if (e.surface === 'terminal') return next(e)
-  const { value: r } = await $.state.get(CURRENT)
+): Promise<RenderElement | undefined> {
+  if (e.surface === 'terminal') return undefined
+  const { value: r } = await host.state.get('current')
   // no report yet, or one of the session before a /clear: ask for one now
   // rather than at the end of the next turn
-  if (!r || r.sessionId !== (await $.session.id())) {
-    warmUp($)
-    if (!r) return next(e)
+  if (!r || r.sessionId !== (await host.session.id())) {
+    warmUp(host)
+    if (!r) return undefined
   }
-  const { value: isOpen = false } = await $.state.get(POPOVER)
-  const { Box, Text, Button } = $.ui.resolve(e)
+  const { value: isOpen = false } = await host.state.get('popover')
+  const { Box, Text, Button } = host.ui.resolve(e)
   const five = r.live?.limits.find(l => l.kind === 'five_hour')
   const ctx = r.live ? (r.live.contextPercent ?? (100 * (r.live.contextTokens ?? r.contextNow)) / Math.max(1, r.live.contextWindow)) : 0
   const percent = five?.session ?? ctx
@@ -58,31 +54,30 @@ export async function renderSessionMode(
     <Box flexDirection="row" alignItems="center" gap={1}>
       {e.props.modes.length > 0 ? <Text dimColor>{e.props.modes.join(' & ')}</Text> : null}
       {/* the footer draws a button's label alone, no chrome: no-break spaces pad it */}
-      <Button plain key="usage-toggle" label={`  ${figure}${isOpen ? ' ▴' : ' ▾'}  `} onPress={() => void $.state.set(POPOVER, !isOpen)} />
+      <Button plain key="usage-toggle" label={`  ${figure}${isOpen ? ' ▴' : ' ▾'}  `} onPress={() => void host.state.set('popover', !isOpen)} />
     </Box>
   )
 }
 
 // the short summary, in the band above the prompt while the footer's button has it open
 export async function renderAbovePrompt(
-  $: EngineInterface,
+  host: Host,
   e: RenderInput<'AbovePrompt'>,
-  next: (e: RenderInput<'AbovePrompt'>) => Promise<RenderElement>,
-): Promise<RenderElement> {
-  if (e.surface === 'terminal' || e.props.hasSurvey) return next(e)
-  const { value: isOpen = false } = await $.state.get(POPOVER)
-  const { value: r } = await $.state.get(CURRENT)
-  if (!isOpen || !r) return next(e)
-  const { value: measure } = await $.state.get(MEASURE)
-  const { Box, Button, Svg } = $.ui.resolve(e)
+): Promise<RenderElement | undefined> {
+  if (e.surface === 'terminal' || e.props.hasSurvey) return undefined
+  const { value: isOpen = false } = await host.state.get('popover')
+  const { value: r } = await host.state.get('current')
+  if (!isOpen || !r) return undefined
+  const { value: measure } = await host.state.get('measure')
+  const { Box, Button, Svg } = host.ui.resolve(e)
   // as wide as the app's own context card, narrower only in a narrow window
   const card = summaryCard(r, measure, Math.min(380, Math.max(260, e.props.bodyColumns * PX_PER_COLUMN - 24)))
   const { width, height } = svgSize(card)
   const openDetails = async () => {
-    await $.state.set(POPOVER, false)
-    await $.ui.open({ id: PANE, title: 'Session usage', columns: 110 })
-    const { value: ref } = await $.state.get(REPORT)
-    if (!ref || ref.sessionId !== r.sessionId || !reports.has(r.sessionId)) await refreshPane($, r.sessionId)
+    await host.state.set('popover', false)
+    await host.ui.open({ id: PANE, title: 'Session usage', columns: 110 })
+    const { value: ref } = await host.state.get('report')
+    if (!ref || ref.sessionId !== r.sessionId || !reports.has(r.sessionId)) await refreshPane(host, r.sessionId)
   }
   // the band is the app's, as wide as the prompt; the card sits in its middle
   return (
