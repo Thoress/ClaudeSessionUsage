@@ -4,7 +4,7 @@ import type { UsageReport } from '../types'
 import { NO_FILTER } from './filter'
 import { windowShare } from './limits'
 import { liveUsage, sessionCosts, windowStart, withShares } from './shares'
-import { analyze } from './transcripts'
+import { analyze, compact } from './transcripts'
 
 const REPORT = { plugin: 'session-insights', key: 'report' } as const
 const CURRENT = { plugin: 'session-insights', key: 'current' } as const
@@ -109,7 +109,7 @@ export async function refreshCurrent($: EngineInterface): Promise<UsageReport | 
   const { value: before } = await $.state.get(CURRENT)
   const report = before?.live && before.sessionId === sessionId ? withShares(r, before.live.limits) : r
   reports.set(sessionId, report)
-  await $.state.set(CURRENT, slim(report))
+  await $.state.set(CURRENT, compact(slim(report)))
   const { value: ref } = await $.state.get(REPORT)
   if (!ref || ref.sessionId === sessionId) await showReport($, report)
   // work that outlives this dispatch runs from a timer

@@ -1,9 +1,9 @@
 import type { EngineInterface } from 'claude-code'
 
 import type { Group, Preview, UsageReport } from '../types'
-import { parseJsonl } from './analyze'
 import { VIEW_PANE } from './constants'
 import { cut, tok } from './format'
+import { type TranscriptIndex, textAt, transcriptIndex } from './transcript-index'
 import { readText } from './transcripts'
 
 const VIEW = { plugin: 'session-insights', key: 'view' } as const
@@ -13,7 +13,7 @@ const VIEW = { plugin: 'session-insights', key: 'view' } as const
 const FILE_CATS = /^(code|doc)_(read|write)$|^(scratch|instructions)$/
 /** Kinds best seen as their turn: what was said, done and answered around them. */
 const TURN_CATS = /^(prompt|reply|thinking)$/
-const PREVIEW_CHARS = 60_000
+export const PREVIEW_CHARS = 60_000
 /** Lines a preview shows at once, until "Show all". */
 export const PREVIEW_LINES = 12
 
@@ -69,7 +69,7 @@ export async function showInFilesPane($: EngineInterface, path: string): Promise
   return shown !== undefined && !shown.isError
 }
 
-const cutTo = (s: string, max: number): { text: string; note?: string } =>
+export const cutTo = (s: string, max: number): { text: string; note?: string } =>
   s.length > max ? { text: s.slice(0, max), note: `first ${tok(max)} of ${tok(s.length)} characters` } : { text: s }
 
 /** A file's text, for the pane; undefined when it is gone or not text. */
@@ -81,47 +81,25 @@ export async function filePreview($: EngineInterface, path: string): Promise<Pre
   return { title: path, source, path, note }
 }
 
-/** A content value (a string or blocks) as text. */
-const textOf = (c: unknown): string =>
-  typeof c === 'string'
-    ? c
-    : Array.isArray(c)
-      ? c
-          .map((b: any) =>
-            typeof b === 'string' ? b : b?.type === 'text' ? String(b.text ?? '') : b?.type === 'image' ? '[image]' : b?.type === 'tool_result' ? textOf(b.content) : '',
-          )
-          .filter(Boolean)
-          .join('\n')
-      : ''
-
-/** The entry's first piece, found again in the transcript: a message's text, or a tool call with its result. */
-export async function contentPreview($: EngineInterface, raw: UsageReport, g: Group): Promise<Preview | undefined> {
-  const rows = parseJsonl(await readText($, raw.file))
+/** The entry's first piece, found in the index: a message's text, or a tool call with its result. */
+export function contentFromIndex(ix: TranscriptIndex, g: Group): Preview | undefined {
   const title = g.label
   const { messageId, toolUseId } = g.ref ?? {}
   // a skill, a message or an injected reminder: its text as the model read it
   if (messageId && (!toolUseId || g.cat === 'skills')) {
-    const row = rows.find(r => r.uuid === messageId)
-    const text = textOf(row?.message?.content) || textOf(Array.isArray(row?.rendered) ? row.rendered.map((x: any) => x?.content ?? x) : row?.rendered)
+    const text = textAt(ix, messageId)
     if (text) {
       const { text: source, note } = cutTo(text, PREVIEW_CHARS)
       return { title, source, note, isMarkdown: true }
     }
   }
   if (!toolUseId) return undefined
-  let use: any
-  let result: unknown
-  for (const r of rows) {
-    for (const b of Array.isArray(r.message?.content) ? r.message.content : []) {
-      if ((b?.type === 'tool_use' || b?.type === 'server_tool_use') && b.id === toolUseId) use = b
-      else if (b?.type === 'tool_result' && b.tool_use_id === toolUseId) result = b.content
-    }
-  }
+  const use = ix.uses.get(toolUseId)
   if (!use) return undefined
   const input = use.input ?? {}
   const command = typeof input.command === 'string' ? input.command : typeof input.cmd === 'string' ? input.cmd : undefined
   const shell = /powershell/i.test(String(use.name)) ? 'powershell' : 'bash'
-  const output = textOf(result)
+  const output = ix.results.get(toolUseId) ?? ''
   const joinNote = (...parts: (string | undefined)[]) => parts.filter(Boolean).join(' · ') || undefined
   // a command or script: the command; its output: the output; else the call and its result
   if (command !== undefined && g.cat !== 'termout') {
@@ -137,17 +115,39 @@ export async function contentPreview($: EngineInterface, raw: UsageReport, g: Gr
   return { title, source, language: 'text', note }
 }
 
-/** One turn as it went: the prompt, Claude's replies, and a line per tool call. */
-export async function turnPreview($: EngineInterface, raw: UsageReport, turn: number): Promise<Preview | undefined> {
+/** Whether the index holds all an entry shows: then a grown transcript need not be read again. */
+export function hasContent(ix: TranscriptIndex, g: Group): boolean {
+  const { messageId, toolUseId } = g.ref ?? {}
+  if (messageId && (!toolUseId || g.cat === 'skills') && textAt(ix, messageId)) return true
+  return toolUseId !== undefined && ix.uses.has(toolUseId) && ix.results.has(toolUseId)
+}
+
+/** The entry's first piece, found again in the transcript: a message's text, or a tool call with its result. */
+export async function contentPreview($: EngineInterface, raw: UsageReport, g: Group): Promise<Preview | undefined> {
+  return contentFromIndex(await transcriptIndex($, raw.file, ix => hasContent(ix, g)), g)
+}
+
+/**
+ * A turn's rows in the index's main chain: from its prompt (else its first
+ * moment) up to the next turn's; `isWhole` once that next turn is in it.
+ */
+export function turnRange(ix: TranscriptIndex, raw: UsageReport, turn: number): { from: number; to: number; isWhole: boolean } | undefined {
   const row = raw.turnRows.find(t => t.turn === turn)
   if (!row) return undefined
   const next = raw.turnRows.find(t => t.turn === turn + 1)
-  const rows = parseJsonl(await readText($, raw.file)).filter(r => r.isSidechain !== true)
-  // from the turn's prompt (else its first moment) to the next turn's
-  const at = (r: any) => (typeof r.timestamp === 'string' ? Date.parse(r.timestamp) : NaN)
-  let from = row.promptId ? rows.findIndex(r => r.uuid === row.promptId) : -1
-  if (from < 0) from = rows.findIndex(r => at(r) >= row.startedAt)
+  let from = row.promptId ? (ix.places.get(row.promptId) ?? -1) : -1
+  if (from < 0) from = ix.ats.findIndex(a => a >= row.startedAt)
   if (from < 0) return undefined
+  let to = from
+  if (next) while (to < ix.ids.length && ix.ids[to] !== next.promptId && !(ix.ats[to]! >= next.startedAt)) to++
+  else to = ix.ids.length
+  return { from, to, isWhole: to < ix.ids.length }
+}
+
+/** One turn as Markdown: the prompt, Claude's replies, and a line per tool call. */
+export function turnMarkdown(ix: TranscriptIndex, raw: UsageReport, turn: number): Preview | undefined {
+  const range = turnRange(ix, raw, turn)
+  if (!range) return undefined
   // who speaks heads each stretch: your words quoted under "You", Claude's
   // text plain under "Claude", its tool calls a list in between
   const parts: string[] = []
@@ -167,29 +167,22 @@ export async function turnPreview($: EngineInterface, raw: UsageReport, turn: nu
       .split('\n')
       .map(l => `> ${l}`)
       .join('\n')
-  for (const r of rows.slice(from)) {
-    if (next && (r.uuid === next.promptId || at(r) >= next.startedAt)) break
-    const content = r.message?.content
-    if (r.type === 'user' && !r.isMeta && !r.isCompactSummary) {
-      const isResult = Array.isArray(content) && content.some((b: any) => b?.type === 'tool_result')
-      const text = isResult ? '' : textOf(content).replace(/<[^>]+>/g, '').trim()
-      if (text) {
-        turnTo('you')
-        parts.push(quote(text))
-      }
-    } else if (r.type === 'assistant') {
-      for (const b of Array.isArray(content) ? content : []) {
-        if (b?.type === 'text' && b.text?.trim()) {
+  for (let i = range.from; i < range.to; i++) {
+    const said = ix.said[i]
+    if (said?.kind === 'you') {
+      turnTo('you')
+      parts.push(quote(said.text))
+    } else if (said?.kind === 'claude') {
+      for (const b of said.blocks) {
+        if (b.kind === 'text') {
           turnTo('claude')
           parts.push(b.text.trim())
-        } else if (b?.type === 'thinking' && b.thinking?.trim()) {
+        } else if (b.kind === 'thinking') {
           turnTo('claude')
-          parts.push(`*Thinking: ${b.thinking.trim().replace(/\s+/g, ' ')}*`)
-        } else if (b?.type === 'tool_use') {
+          parts.push(`*Thinking: ${b.text.trim().replace(/\s+/g, ' ')}*`)
+        } else {
           if (speaker !== 'claude') turnTo('claude')
-          const i = b.input ?? {}
-          const what = String(i.description ?? i.file_path ?? i.command ?? i.pattern ?? i.url ?? i.query ?? i.skill ?? '').split('\n')[0]!.slice(0, 100)
-          calls.push(`- \`${b.name}\`${what ? ` ${what.replace(/[`*_]/g, '')}` : ''}`)
+          calls.push(`- \`${b.tool}\`${b.what ? ` ${b.what.replace(/[`*_]/g, '')}` : ''}`)
         }
       }
     }
@@ -197,7 +190,13 @@ export async function turnPreview($: EngineInterface, raw: UsageReport, turn: nu
   flushCalls()
   if (parts.length === 0) return undefined
   const { text: source, note } = cutTo(parts.join('\n\n').replace(/^---\n\n/, ''), PREVIEW_CHARS)
-  return { title: `Turn ${turn}: ${row.prompt}`, source, note, isMarkdown: true }
+  return { title: `Turn ${turn}: ${raw.turnRows.find(t => t.turn === turn)!.prompt}`, source, note, isMarkdown: true }
+}
+
+/** One turn as it went: the prompt, Claude's replies, and a line per tool call. */
+export async function turnPreview($: EngineInterface, raw: UsageReport, turn: number): Promise<Preview | undefined> {
+  if (!raw.turnRows.some(t => t.turn === turn)) return undefined
+  return turnMarkdown(await transcriptIndex($, raw.file, ix => turnRange(ix, raw, turn)?.isWhole === true), raw, turn)
 }
 
 /** Opens a preview whole in a tab of its own, which scrolls. */
