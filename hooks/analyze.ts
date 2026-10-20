@@ -334,12 +334,33 @@ const ts = (r: Row): number => {
   return Number.isFinite(t) ? t : NaN
 }
 
+/** A chain read so far: more rows can follow. */
+export type Chain = {
+  res: ChainResult
+  /** Reads the next rows, in the file's order. */
+  feed: (rows: Row[]) => void
+  /**
+   * Closes the request still streaming, as the rows' end would, so `res`
+   * reads as a whole analysis of the rows so far; the function it returns
+   * opens it again for the rows still to come.
+   */
+  settle: () => () => void
+}
+
 /**
  * Analyzes one conversation chain: the main session or one subagent. A
  * subagent has no turns of its own: `turnOf` names the main turn a moment
  * belongs to, so its requests count toward the turn that ran it.
  */
 export function analyzeChain(rows: Row[], turnOf?: (at: number) => number): ChainResult {
+  const c = chainOf(turnOf)
+  c.feed(rows)
+  c.settle()
+  return c.res
+}
+
+/** A chain to feed rows to as they are written: the state stays between feeds. */
+export function chainOf(turnOf?: (at: number) => number): Chain {
   const res: ChainResult = {
     added: {},
     processed: {},
@@ -611,6 +632,8 @@ export function analyzeChain(rows: Row[], turnOf?: (at: number) => number): Chai
       costOutput: 0,
       isBreak,
     }
+    // every live item, every request: the turn's entries looked up once per kind
+    const tcs: Record<string, TurnCat> = {}
     for (const it of live) {
       const c = it.tokens * rateOf(it) * scale
       it.cost += c
@@ -619,7 +642,7 @@ export function analyzeChain(rows: Row[], turnOf?: (at: number) => number): Chai
       it.reads++
       it.processed += it.tokens
       add(res.processed, it.cat, it.tokens)
-      const tc = turnCat(tn, it.cat)
+      const tc = (tcs[it.cat] ??= turnCat(tn, it.cat))
       tc.inputCost += c
       tc.processed += it.tokens
       const pc = pointCat(point, it.cat)
@@ -655,151 +678,208 @@ export function analyzeChain(rows: Row[], turnOf?: (at: number) => number): Chai
   }
 
   const seen = new Set<string>()
-  for (const r of rows) {
-    if (typeof r.uuid === 'string') {
-      if (seen.has(r.uuid)) continue
-      seen.add(r.uuid)
-    }
-    const at = ts(r)
-    const type = r.type
-
-    if (type === 'system') {
-      if (r.subtype === 'compact_boundary') {
-        closeRequest()
-        for (const it of live) if (it !== sysItem) it.tokens = 0
-        live = sysItem ? [sysItem] : []
-        prevCtx = sysItem?.tokens ?? 0
-        compactedSince = true
+  const feed = (rows: Row[]) => {
+    for (const r of rows) {
+      if (typeof r.uuid === 'string') {
+        if (seen.has(r.uuid)) continue
+        seen.add(r.uuid)
       }
-      if (r.subtype === 'stop_hook_summary') {
-        mark(at)
-        turnEnded = true
-      }
-      continue
-    }
+      const at = ts(r)
+      const type = r.type
 
-    if (type === 'attachment') {
-      const a = r.attachment ?? {}
-      const kind = String(a.type ?? '')
-      const w = renderedWeight(r)
-      const cat = attachmentCat(kind)
-      const files: { path?: unknown; content?: unknown }[] =
-        cat !== 'instructions' ? [] : Array.isArray(a.files) ? a.files : typeof a.path === 'string' ? [{ path: a.path, content: a.content }] : []
-      const sizes = files.map(f => Math.max(1, textLen(f.content)))
-      const all = sizes.reduce((x, y) => x + y, 0)
-      if (w > 0 && files.length > 0) {
-        files.forEach((f, k) =>
-          pending.push(newItem('instructions', (w * sizes[k]!) / all, `Instructions: ${baseName(f.path)}`, undefined, { path: str(f.path), messageId: rowId(r.uuid) })),
-        )
-      } else if (w > 0) pending.push(newItem(cat, w, `Reminder: ${kind}`, undefined, { messageId: rowId(r.uuid) }))
-      touch(at)
-      if (Number.isFinite(at)) lastInputAt = at
-      continue
-    }
-
-    if (type === 'assistant') {
-      const msg = r.message ?? {}
-      if (msg.model === '<synthetic>') continue
-      const id = String(msg.id ?? r.uuid)
-      if (!cur || cur.id !== id) {
-        if (turnEnded || !turn) {
+      if (type === 'system') {
+        if (r.subtype === 'compact_boundary') {
           closeRequest()
-          startTurn(wakeLabel || '(no prompt: woken by a background event)', Number.isFinite(lastInputAt) ? lastInputAt : at)
+          for (const it of live) if (it !== sysItem) it.tokens = 0
+          live = sysItem ? [sysItem] : []
+          prevCtx = sysItem?.tokens ?? 0
+          compactedSince = true
         }
-        openRequest(id, msg.usage ?? {}, at, String(msg.model ?? ''))
+        if (r.subtype === 'stop_hook_summary') {
+          mark(at)
+          turnEnded = true
+        }
+        continue
       }
-      if (cur && Number.isFinite(at)) cur.endedAt = Math.max(cur.endedAt, at)
-      touch(at)
-      mark(at)
-      for (const b of Array.isArray(msg.content) ? msg.content : []) {
-        if (b.type === 'thinking' || b.type === 'redacted_thinking') {
-          const w = textLen(b.thinking)
-          cur?.blocks.push({ cat: 'thinking', w })
-          if (w > 0) pending.push(newItem('thinking', w, 'Thinking'))
-        } else if (b.type === 'text') {
-          const w = textLen(b.text)
-          const item = newItem('reply', w, `Reply: ${firstLine(b.text, 55)}`, undefined, { messageId: rowId(r.uuid) })
-          cur?.blocks.push({ cat: 'reply', w, item })
-          pending.push(item)
-        } else if (b.type === 'tool_use' || b.type === 'server_tool_use') {
-          const tool = classifyTool(String(b.name), b.input)
-          const info = { ...tool, startedAt: at, ref: { path: tool.path, url: tool.url, toolUseId: rowId(b.id) } }
-          toolUses.set(b.id, info)
-          const w = JSON.stringify(b.input ?? {}).length + String(b.name).length
-          const item = newItem(info.inCat, w, info.label, undefined, info.ref)
-          cur?.blocks.push({ cat: info.inCat, w, item })
-          pending.push(item)
-          if (info.name === 'Agent' || info.name === 'Task') res.agentLabels.set(b.id, info.label)
-        }
-      }
-      continue
-    }
 
-    if (type === 'user') {
-      const msg = r.message ?? {}
-      const content = msg.content
-      const blocks: any[] = Array.isArray(content) ? content : []
-      const results = blocks.filter(b => b?.type === 'tool_result')
-      touch(at)
-
-      if (results.length > 0) {
-        mark(at)
-        for (const b of results) {
-          const info = toolUses.get(b.tool_use_id)
-          const w = weight(b.content)
-          const cat = info?.outCat ?? 'other_tools'
-          pending.push(newItem(cat, w, info ? `${info.label} → result` : 'Tool result', info?.name, info?.ref ?? { toolUseId: rowId(b.tool_use_id) }))
-          if (info && Number.isFinite(info.startedAt) && Number.isFinite(at)) {
-            const ms = Math.max(0, at - info.startedAt)
-            const src = String(r.permissionDecision?.source ?? '')
-            const bucket = /user|prompt|dialog/i.test(src) ? 'approval' : info.bucket
-            turn?.intervals.push({ from: info.startedAt, to: info.startedAt + ms, kind: 'tool', bucket, tool: info.name })
-            const row = res.tools.get(info.name) ?? { tool: info.name, calls: 0, ms: 0, resultTokens: 0 }
-            row.calls++
-            row.ms += ms
-            res.tools.set(info.name, row)
-            const tn = turnNow(info.startedAt)
-            res.slow.push({ label: info.label, ms, bucket, turn: tn, toolUseId: info.ref.toolUseId })
-            const key = `${tn}|${info.name}`
-            const tt = res.toolTurns.get(key) ?? { turn: tn, tool: info.name, calls: 0, ms: 0, resultTokens: 0 }
-            tt.calls++
-            tt.ms += ms
-            res.toolTurns.set(key, tt)
-          }
-          const agentId = r.toolUseResult?.agentId
-          if (typeof agentId === 'string') res.agentIds.set(b.tool_use_id, agentId)
-        }
-        const extra = blocks.filter(b => b?.type !== 'tool_result')
-        const ew = weight(extra)
-        if (ew > 0) pending.push(newItem('reminders', ew, 'Note beside a tool result'))
+      if (type === 'attachment') {
+        const a = r.attachment ?? {}
+        const kind = String(a.type ?? '')
+        const w = renderedWeight(r)
+        const cat = attachmentCat(kind)
+        const files: { path?: unknown; content?: unknown }[] =
+          cat !== 'instructions' ? [] : Array.isArray(a.files) ? a.files : typeof a.path === 'string' ? [{ path: a.path, content: a.content }] : []
+        const sizes = files.map(f => Math.max(1, textLen(f.content)))
+        const all = sizes.reduce((x, y) => x + y, 0)
+        if (w > 0 && files.length > 0) {
+          files.forEach((f, k) =>
+            pending.push(newItem('instructions', (w * sizes[k]!) / all, `Instructions: ${baseName(f.path)}`, undefined, { path: str(f.path), messageId: rowId(r.uuid) })),
+          )
+        } else if (w > 0) pending.push(newItem(cat, w, `Reminder: ${kind}`, undefined, { messageId: rowId(r.uuid) }))
+        touch(at)
         if (Number.isFinite(at)) lastInputAt = at
         continue
       }
 
-      const w = weight(content)
-      const text = typeof content === 'string' ? content : blocks.filter(b => b?.type === 'text').map(b => b.text).join('\n')
-      if (r.isCompactSummary) {
-        pending.push(newItem('compaction', w, 'Compaction summary'))
-      } else if (r.isMeta) {
-        const isSkill = /^Base directory for this skill/.test(text)
-        if (turnEnded) wakeLabel = `(woken) ${firstLine(text.replace(/<[^>]+>/g, ' '), 70)}`
-        const ref = { messageId: rowId(r.uuid), path: isSkill && skillDir(text) ? `${skillDir(text)}/SKILL.md` : undefined }
-        pending.push(newItem(isSkill ? 'skills' : 'reminders', w, isSkill ? `Skill: ${skillName(text)}` : `Meta: ${firstLine(text, 50)}`, undefined, ref))
-      } else {
-        closeRequest()
-        const isNotification = /^<task-notification>/.test(text.trim())
-        const label = isNotification ? 'Background task notification' : firstLine(text.replace(/<[^>]+>/g, ' '), 80)
-        pending.push(newItem(isNotification ? 'reminders' : 'prompt', w, `Prompt: ${label}`, undefined, { messageId: rowId(r.uuid) }))
-        if (!res.firstPrompt) res.firstPrompt = label
-        if (!isNotification || !turn || turnEnded) startTurn(isNotification ? `(woken) ${label}` : label, at, rowId(r.uuid))
-        wakeLabel = ''
+      if (type === 'assistant') {
+        const msg = r.message ?? {}
+        if (msg.model === '<synthetic>') continue
+        const id = String(msg.id ?? r.uuid)
+        if (!cur || cur.id !== id) {
+          if (turnEnded || !turn) {
+            closeRequest()
+            startTurn(wakeLabel || '(no prompt: woken by a background event)', Number.isFinite(lastInputAt) ? lastInputAt : at)
+          }
+          openRequest(id, msg.usage ?? {}, at, String(msg.model ?? ''))
+        }
+        if (cur && Number.isFinite(at)) cur.endedAt = Math.max(cur.endedAt, at)
+        touch(at)
+        mark(at)
+        for (const b of Array.isArray(msg.content) ? msg.content : []) {
+          if (b.type === 'thinking' || b.type === 'redacted_thinking') {
+            const w = textLen(b.thinking)
+            cur?.blocks.push({ cat: 'thinking', w })
+            if (w > 0) pending.push(newItem('thinking', w, 'Thinking'))
+          } else if (b.type === 'text') {
+            const w = textLen(b.text)
+            const item = newItem('reply', w, `Reply: ${firstLine(b.text, 55)}`, undefined, { messageId: rowId(r.uuid) })
+            cur?.blocks.push({ cat: 'reply', w, item })
+            pending.push(item)
+          } else if (b.type === 'tool_use' || b.type === 'server_tool_use') {
+            const tool = classifyTool(String(b.name), b.input)
+            const info = { ...tool, startedAt: at, ref: { path: tool.path, url: tool.url, toolUseId: rowId(b.id) } }
+            toolUses.set(b.id, info)
+            const w = JSON.stringify(b.input ?? {}).length + String(b.name).length
+            const item = newItem(info.inCat, w, info.label, undefined, info.ref)
+            cur?.blocks.push({ cat: info.inCat, w, item })
+            pending.push(item)
+            if (info.name === 'Agent' || info.name === 'Task') res.agentLabels.set(b.id, info.label)
+          }
+        }
+        continue
       }
-      if (Number.isFinite(at)) lastInputAt = at
-      continue
+
+      if (type === 'user') {
+        const msg = r.message ?? {}
+        const content = msg.content
+        const blocks: any[] = Array.isArray(content) ? content : []
+        const results = blocks.filter(b => b?.type === 'tool_result')
+        touch(at)
+
+        if (results.length > 0) {
+          mark(at)
+          for (const b of results) {
+            const info = toolUses.get(b.tool_use_id)
+            const w = weight(b.content)
+            const cat = info?.outCat ?? 'other_tools'
+            pending.push(newItem(cat, w, info ? `${info.label} → result` : 'Tool result', info?.name, info?.ref ?? { toolUseId: rowId(b.tool_use_id) }))
+            if (info && Number.isFinite(info.startedAt) && Number.isFinite(at)) {
+              const ms = Math.max(0, at - info.startedAt)
+              const src = String(r.permissionDecision?.source ?? '')
+              const bucket = /user|prompt|dialog/i.test(src) ? 'approval' : info.bucket
+              turn?.intervals.push({ from: info.startedAt, to: info.startedAt + ms, kind: 'tool', bucket, tool: info.name })
+              const row = res.tools.get(info.name) ?? { tool: info.name, calls: 0, ms: 0, resultTokens: 0 }
+              row.calls++
+              row.ms += ms
+              res.tools.set(info.name, row)
+              const tn = turnNow(info.startedAt)
+              res.slow.push({ label: info.label, ms, bucket, turn: tn, toolUseId: info.ref.toolUseId })
+              const key = `${tn}|${info.name}`
+              const tt = res.toolTurns.get(key) ?? { turn: tn, tool: info.name, calls: 0, ms: 0, resultTokens: 0 }
+              tt.calls++
+              tt.ms += ms
+              res.toolTurns.set(key, tt)
+            }
+            const agentId = r.toolUseResult?.agentId
+            if (typeof agentId === 'string') res.agentIds.set(b.tool_use_id, agentId)
+          }
+          const extra = blocks.filter(b => b?.type !== 'tool_result')
+          const ew = weight(extra)
+          if (ew > 0) pending.push(newItem('reminders', ew, 'Note beside a tool result'))
+          if (Number.isFinite(at)) lastInputAt = at
+          continue
+        }
+
+        const w = weight(content)
+        const text = typeof content === 'string' ? content : blocks.filter(b => b?.type === 'text').map(b => b.text).join('\n')
+        if (r.isCompactSummary) {
+          pending.push(newItem('compaction', w, 'Compaction summary'))
+        } else if (r.isMeta) {
+          const isSkill = /^Base directory for this skill/.test(text)
+          if (turnEnded) wakeLabel = `(woken) ${firstLine(text.replace(/<[^>]+>/g, ' '), 70)}`
+          const ref = { messageId: rowId(r.uuid), path: isSkill && skillDir(text) ? `${skillDir(text)}/SKILL.md` : undefined }
+          pending.push(newItem(isSkill ? 'skills' : 'reminders', w, isSkill ? `Skill: ${skillName(text)}` : `Meta: ${firstLine(text, 50)}`, undefined, ref))
+        } else {
+          closeRequest()
+          const isNotification = /^<task-notification>/.test(text.trim())
+          const label = isNotification ? 'Background task notification' : firstLine(text.replace(/<[^>]+>/g, ' '), 80)
+          pending.push(newItem(isNotification ? 'reminders' : 'prompt', w, `Prompt: ${label}`, undefined, { messageId: rowId(r.uuid) }))
+          if (!res.firstPrompt) res.firstPrompt = label
+          if (!isNotification || !turn || turnEnded) startTurn(isNotification ? `(woken) ${label}` : label, at, rowId(r.uuid))
+          wakeLabel = ''
+        }
+        if (Number.isFinite(at)) lastInputAt = at
+        continue
+      }
     }
   }
-  closeRequest()
-  return res
+
+  const settle = () => {
+    const c = cur
+    if (!c) return () => {}
+    // what closing changes, to put back: few objects, as it touches only
+    // this request's blocks, its turn and its point
+    const point = c.point
+    const closed: RequestPoint = { ...point }
+    if (point.cats) closed.cats = Object.fromEntries(Object.entries(point.cats).map(([k, v]) => [k, [...v] as [number, number, number]]))
+    const t = turn
+    const before = {
+      output: c.output,
+      outputTotal: res.outputTotal,
+      estimatedOutputs: res.estimatedOutputs,
+      thinking: res.thinking,
+      costOutput: res.cost.output,
+      outputs: { ...res.output },
+      outputCosts: { ...res.outputCost },
+      turn: t && { outputTokens: t.outputTokens, cost: t.cost, intervals: t.intervals.length },
+    }
+    const keys = [...new Set(['thinking', 'reply', ...c.blocks.map(b => b.cat)])].map(cat => `${c.turn}|${cat}`)
+    const turnCats = keys.map(key => [key, res.turnCats.get(key)] as const).map(([key, tc]) => [key, tc && { ...tc }] as const)
+    const items = c.blocks.flatMap(b => (b.item ? [[b.item, b.item.outCost, b.item.byTurn[c.turn]] as const] : []))
+    // the report may keep the closed point: closing writes into a copy
+    const last = res.points.length - 1
+    res.points[last] = closed
+    c.point = closed
+    closeRequest()
+    return () => {
+      cur = c
+      c.point = point
+      res.points[last] = point
+      c.output = before.output
+      res.outputTotal = before.outputTotal
+      res.estimatedOutputs = before.estimatedOutputs
+      res.thinking = before.thinking
+      res.cost.output = before.costOutput
+      res.output = before.outputs
+      res.outputCost = before.outputCosts
+      for (const [key, tc] of turnCats) {
+        if (tc) Object.assign(res.turnCats.get(key)!, tc)
+        else res.turnCats.delete(key)
+      }
+      for (const [it, outCost, byTurn] of items) {
+        it.outCost = outCost
+        if (byTurn === undefined) delete it.byTurn[c.turn]
+        else it.byTurn[c.turn] = byTurn
+      }
+      if (t && before.turn) {
+        t.outputTokens = before.turn.outputTokens
+        t.cost = before.turn.cost
+        t.intervals.length = before.turn.intervals
+      }
+    }
+  }
+
+  return { res, feed, settle }
 }
 
 /** Splits a turn's wall time into buckets: model > tool > overhead. */
@@ -840,6 +920,13 @@ function turnTime(t: Turn): Record<string, number> {
 
 const cmpDesc = <T>(f: (x: T) => number) => (a: T, b: T) => f(b) - f(a)
 
+/** The main turn running at a moment: a subagent's moment belongs to it. */
+export function turnAt(turns: { startedAt: number }[], at: number): number {
+  let k = 0
+  for (let i = 0; i < turns.length; i++) if (turns[i]!.startedAt <= at) k = i + 1
+  return k
+}
+
 export function buildReport(
   sessionId: string,
   file: string,
@@ -848,14 +935,13 @@ export function buildReport(
   now: number,
 ): UsageReport {
   const m = analyzeChain(main.filter(r => r.isSidechain !== true))
-  // a subagent's moment belongs to the main turn running then
-  const starts = m.turns.map(t => t.startedAt)
-  const turnOf = (at: number) => {
-    let k = 0
-    for (let i = 0; i < starts.length; i++) if (starts[i]! <= at) k = i + 1
-    return k
-  }
-  const subs = subagents.map(s => ({ id: s.id, r: analyzeChain(s.rows, turnOf) }))
+  const subs = subagents.map(s => ({ id: s.id, r: analyzeChain(s.rows, at => turnAt(m.turns, at)) }))
+  return reportOf(sessionId, file, m, subs, now)
+}
+
+/** The report of chains read to their end (or settled). It shares no object the chains change later. */
+export function reportOf(sessionId: string, file: string, m: ChainResult, subs: { id: string; r: ChainResult }[], now: number): UsageReport {
+  const turnOf = (at: number) => turnAt(m.turns, at)
   const all = [m, ...subs.map(s => s.r)]
 
   const cats: CatRow[] = Object.entries(CATS)
@@ -1033,7 +1119,8 @@ export function buildReport(
     price: priceOf(m.model),
     cost,
     ttl: { w5: sum(c => c.ttl.w5), w1h: sum(c => c.ttl.w1h) },
-    series: m.points,
+    // the chain goes on adding to its own list
+    series: m.points.slice(),
     breaks: all.flatMap(c => c.breaks).sort((a, b) => a.at - b.at),
     cats,
     time: timeRows,
@@ -1073,19 +1160,29 @@ function mergeRef(a: Ref | undefined, b: Ref): Ref | undefined {
   return Object.keys(out).length > 0 ? out : undefined
 }
 
+/** Whether `a` already has every field `b` says: merging `b` would change nothing. */
+const refCovers = (a: Ref | undefined, b: Ref) =>
+  (b.path === undefined || a?.path !== undefined) &&
+  (b.url === undefined || a?.url !== undefined) &&
+  (b.toolUseId === undefined || a?.toolUseId !== undefined) &&
+  (b.messageId === undefined || a?.messageId !== undefined)
+
 /** Items summed by kind and name, the most expensive 40 of each kind kept. */
 function groupItems(items: Item[], turnCats: TurnCat[]): Group[] {
   const byKey = new Map<string, Group>()
+  const groupOf: Group[] = []
   for (const it of items) {
     const label = groupLabel(it)
     const key = `${it.cat}|${label}`
-    const g = byKey.get(key) ?? { cat: it.cat, label, cost: 0, tokens: 0, count: 0, byTurn: {} }
+    let g = byKey.get(key)
+    if (!g) {
+      g = { cat: it.cat, label, cost: 0, tokens: 0, count: 0, byTurn: {} }
+      byKey.set(key, g)
+    }
     g.cost += it.cost + it.outCost
     g.tokens += it.tokens
     g.count++
-    for (const [turn, c] of Object.entries(it.byTurn)) g.byTurn[turn] = (g.byTurn[turn] ?? 0) + c
-    if (it.ref) g.ref = mergeRef(g.ref, it.ref)
-    byKey.set(key, g)
+    groupOf.push(g)
   }
   // thinking leaves no item behind (its text is not kept): one entry per turn
   for (const t of turnCats) {
@@ -1101,8 +1198,22 @@ function groupItems(items: Item[], turnCats: TurnCat[]): Group[] {
   }
   const kept: Group[] = []
   const byCat = new Map<string, Group[]>()
-  for (const g of byKey.values()) byCat.set(g.cat, [...(byCat.get(g.cat) ?? []), g])
+  for (const g of byKey.values()) {
+    const list = byCat.get(g.cat)
+    if (list) list.push(g)
+    else byCat.set(g.cat, [g])
+  }
   for (const list of byCat.values()) kept.push(...list.sort(cmpDesc(g => g.cost)).slice(0, 40))
+  // the turns and the link only of the entries kept: a long session has thousands
+  const isKept = new Set(kept)
+  items.forEach((it, k) => {
+    const g = groupOf[k]!
+    if (!isKept.has(g)) return
+    const byTurn: Record<string, number> = it.byTurn
+    for (const turn in byTurn) g.byTurn[turn] = (g.byTurn[turn] ?? 0) + byTurn[turn]!
+    // a link already whole stays as it is
+    if (it.ref && !refCovers(g.ref, it.ref)) g.ref = mergeRef(g.ref, it.ref)
+  })
   return kept
 }
 
